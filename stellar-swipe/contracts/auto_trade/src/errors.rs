@@ -17,4 +17,5 @@ pub enum AutoTradeError {
     PositionAlreadyExists = 11,
     InsufficientPriceHistory = 12,
     RankingDisabled = 13,
+    RateLimited = 14,
 }

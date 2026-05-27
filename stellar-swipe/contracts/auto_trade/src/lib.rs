@@ -2,6 +2,7 @@
 
 use soroban_sdk::{contract, contractimpl, contracttype, Address, Env, Symbol};
 
+mod admin;
 mod auth;
 mod errors;
 mod history;
@@ -79,6 +80,11 @@ impl AutoTradeContract {
         }
 
         user.require_auth();
+
+        // Check if user is rate limited
+        if admin::is_rate_limited(&env, &user) {
+            return Err(AutoTradeError::RateLimited);
+        }
 
         let signal = storage::get_signal(&env, signal_id).ok_or(AutoTradeError::SignalNotFound)?;
 
@@ -288,6 +294,27 @@ impl AutoTradeContract {
     /// Get authorization config
     pub fn get_auth_config(env: Env, user: Address) -> Option<auth::AuthConfig> {
         auth::get_auth_config(&env, &user)
+    }
+
+    /// Set rate limit flag for a user (operator only)
+    /// Flag expires after 1 hour (RATE_LIMIT_DURATION_SECONDS = 3600)
+    pub fn set_rate_limited(env: Env, operator: Address, user: Address) -> Result<(), AutoTradeError> {
+        admin::set_rate_limited(&env, &operator, &user)
+    }
+
+    /// Clear rate limit flag for a user (operator only)
+    pub fn clear_rate_limited(env: Env, operator: Address, user: Address) -> Result<(), AutoTradeError> {
+        admin::clear_rate_limited(&env, &operator, &user)
+    }
+
+    /// Get rate limit info for a user
+    pub fn get_rate_limit_info(env: Env, user: Address) -> Option<storage::RateLimitInfo> {
+        admin::get_rate_limit_info(&env, &user)
+    }
+
+    /// Check if user is currently rate limited
+    pub fn is_rate_limited(env: Env, user: Address) -> bool {
+        admin::is_rate_limited(&env, &user)
     }
 
     /// Returns estimated storage usage metrics.
