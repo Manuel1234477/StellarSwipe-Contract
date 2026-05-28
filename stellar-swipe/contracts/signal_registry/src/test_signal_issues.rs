@@ -277,3 +277,83 @@ fn issue170_non_executor_rejected() {
     let r = client.try_record_signal_outcome(&rando, &signal_id, &SignalOutcome::Profit);
     assert!(r.is_err());
 }
+
+#[test]
+fn issue417_signal_within_warning_window_emits_event() {
+    let env = Env::default();
+    env.mock_all_auths();
+    #[allow(deprecated)]
+    let contract_id = env.register_contract(None, SignalRegistry);
+    let client = SignalRegistryClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+    client.initialize(&admin);
+    let provider = Address::generate(&env);
+    let tags = Vec::new(&env);
+    let signal_id = client.create_signal(
+        &provider,
+        &String::from_str(&env, "XLM/USDC"),
+        &crate::types::SignalAction::Buy,
+        &100_000,
+        &String::from_str(&env, "Rationale"),
+        &500,
+        &crate::categories::SignalCategory::SWING,
+        &tags,
+        &crate::categories::RiskLevel::Medium,
+    );
+    let signal = client.get_signal(&signal_id).unwrap();
+    assert!(signal.warning_emitted);
+}
+
+#[test]
+fn issue417_signal_outside_window_no_event() {
+    let env = Env::default();
+    env.mock_all_auths();
+    #[allow(deprecated)]
+    let contract_id = env.register_contract(None, SignalRegistry);
+    let client = SignalRegistryClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+    client.initialize(&admin);
+    let provider = Address::generate(&env);
+    let tags = Vec::new(&env);
+    let signal_id = client.create_signal(
+        &provider,
+        &String::from_str(&env, "XLM/USDC"),
+        &crate::types::SignalAction::Buy,
+        &100_000,
+        &String::from_str(&env, "Rationale"),
+        &2000,
+        &crate::categories::SignalCategory::SWING,
+        &tags,
+        &crate::categories::RiskLevel::Medium,
+    );
+    let signal = client.get_signal(&signal_id).unwrap();
+    assert!(!signal.warning_emitted);
+}
+
+#[test]
+fn issue417_second_call_no_duplicate_event() {
+    let env = Env::default();
+    env.mock_all_auths();
+    #[allow(deprecated)]
+    let contract_id = env.register_contract(None, SignalRegistry);
+    let client = SignalRegistryClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+    client.initialize(&admin);
+    let provider = Address::generate(&env);
+    let tags = Vec::new(&env);
+    let signal_id = client.create_signal(
+        &provider,
+        &String::from_str(&env, "XLM/USDC"),
+        &crate::types::SignalAction::Buy,
+        &100_000,
+        &String::from_str(&env, "Rationale"),
+        &500,
+        &crate::categories::SignalCategory::SWING,
+        &tags,
+        &crate::categories::RiskLevel::Medium,
+    );
+    let signal1 = client.get_signal(&signal_id).unwrap();
+    assert!(signal1.warning_emitted);
+    let signal2 = client.get_signal(&signal_id).unwrap();
+    assert!(signal2.warning_emitted);
+}

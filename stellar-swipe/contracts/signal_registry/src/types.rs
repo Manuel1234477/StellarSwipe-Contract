@@ -81,6 +81,8 @@ pub struct Signal {
     pub avg_copier_roi_bps: i32,
     /// Number of copiers whose positions have closed (denominator for avg_copier_roi_bps).
     pub copier_closed_count: u32,
+    /// Whether expiry warning has been emitted for this signal (Issue #417).
+    pub warning_emitted: bool,
 }
 
 /// Legacy on-chain format (v1) before v2 added `submitted_at`, `rationale_hash`,

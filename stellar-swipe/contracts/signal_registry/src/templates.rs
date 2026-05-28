@@ -192,6 +192,8 @@ mod tests {
         let result = save_signal_template(&env, &mut templates, provider, template(&env));
         assert_eq!(result, Err(TemplateError::TemplateLimitReached));
     }
+}
+
 extern crate alloc;
 
 use alloc::string::{String as RustString, ToString};

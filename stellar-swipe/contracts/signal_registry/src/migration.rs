@@ -40,6 +40,7 @@ fn v1_to_v2(_env: &Env, v1: &SignalV1) -> Signal {
         ai_validation_score: None,
         avg_copier_roi_bps: 0,
         copier_closed_count: 0,
+        warning_emitted: false,
     }
 }
 

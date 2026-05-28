@@ -74,6 +74,7 @@ use types::{
 use versioning::{CopyRecord, SignalVersion};
 
 const MAX_EXPIRY_SECONDS: u64 = SECONDS_PER_30_DAY_MONTH;
+const WARNING_WINDOW_LEDGERS: u64 = 720;
 
 #[contract]
 pub struct SignalRegistry;
@@ -737,6 +738,7 @@ impl SignalRegistry {
             ai_validation_score: None,
             avg_copier_roi_bps: 0,
             copier_closed_count: 0,
+            warning_emitted: false,
         };
 
         // Auto-enter signal into active contests (before moving signal)
@@ -772,7 +774,7 @@ impl SignalRegistry {
 
     pub fn get_signal(env: Env, signal_id: u64) -> Option<Signal> {
         let mut signals = Self::get_signals_map(&env);
-        let signal = signals.get(signal_id)?;
+        let mut signal = signals.get(signal_id)?;
 
         // If signal is still active, check whether the provider account still exists.
         // If the provider has merged/deleted their account, orphan the signal in-place.
@@ -781,6 +783,22 @@ impl SignalRegistry {
         {
             Self::orphan_signal(&env, &mut signals, signal_id);
             return signals.get(signal_id);
+        }
+
+        // Check for expiry warning (Issue #417)
+        let current_ledger = env.ledger().sequence();
+        let time_to_expiry = signal.expiry.saturating_sub(current_ledger);
+        if time_to_expiry <= WARNING_WINDOW_LEDGERS && !signal.warning_emitted {
+            events::emit_signal_expiry_warning(
+                &env,
+                signal_id,
+                signal.provider.clone(),
+                signal.expiry,
+                time_to_expiry,
+            );
+            signal.warning_emitted = true;
+            signals.set(signal_id, signal.clone());
+            Self::save_signals_map(&env, &signals);
         }
 
         Some(signal)

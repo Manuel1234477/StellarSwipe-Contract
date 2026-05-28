@@ -306,6 +306,7 @@ mod feed_tests {
                 ai_validation_score: None,
                 avg_copier_roi_bps: 0,
                 copier_closed_count: 0,
+                warning_emitted: false,
             };
             m.set(id, s);
         }

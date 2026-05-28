@@ -285,6 +285,7 @@ mod tests {
             ai_validation_score: None,
             avg_copier_roi_bps: 0,
             copier_closed_count: 0,
+            warning_emitted: false,
         };
 
         let status = evaluate_signal_status(&signal, 2001);
@@ -319,6 +320,7 @@ mod tests {
             ai_validation_score: None,
             avg_copier_roi_bps: 0,
             copier_closed_count: 0,
+            warning_emitted: false,
         }
     }
 
@@ -399,6 +401,7 @@ mod tests {
             ai_validation_score: None,
             avg_copier_roi_bps: 0,
             copier_closed_count: 0,
+            warning_emitted: false,
         };
 
         assert_eq!(get_signal_average_roi(&signal), 0);
