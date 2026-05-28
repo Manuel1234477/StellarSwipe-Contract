@@ -1,9 +1,13 @@
 use soroban_sdk::{Address, Env, Map, String, BytesN};
 use crate::submission::{Action, Signal};
+use crate::types::{ProviderProfile, Outcome};
 
 /// Maximum allowed price deviation from oracle price (in basis points)
 /// 2000 = 20% deviation allowed
 pub const MAX_PRICE_DEVIATION_BPS: u32 = 2000;
+
+/// Cooling-off period after 5 consecutive losses (in ledgers, ~4 hours)
+pub const COOLING_OFF_PERIOD_LEDGERS: u64 = 2880;
 
 /// Error type for duplicate signal detection
 #[derive(Debug, PartialEq)]
@@ -263,6 +267,44 @@ fn is_price_reasonable(signal_price: i128, oracle_price: i128) -> bool {
     
     // Check if within acceptable range
     deviation_bps <= MAX_PRICE_DEVIATION_BPS as u128
+}
+
+/// Check if provider is in cooling-off period (Issue #420).
+/// Returns true if all last 5 outcomes are Loss and cooling period hasn't ended.
+pub fn is_provider_cooling_off(env: &Env, profile: &ProviderProfile) -> bool {
+    if profile.cooling_off_ends_at == 0 {
+        return false;
+    }
+
+    let current_ledger = env.ledger().sequence();
+    if current_ledger >= profile.cooling_off_ends_at {
+        return false;
+    }
+
+    if profile.last_5_outcomes.len() < 5 {
+        return false;
+    }
+
+    for i in 0..5 {
+        if let Some(outcome) = profile.last_5_outcomes.get(i as u32) {
+            if outcome != &Outcome::Loss {
+                return false;
+            }
+        } else {
+            return false;
+        }
+    }
+
+    true
+}
+
+/// Update provider outcomes tracking (Issue #420).
+/// Keeps only the last 5 outcomes in a ring buffer.
+pub fn update_provider_outcomes(profile: &mut ProviderProfile, outcome: Outcome) {
+    if profile.last_5_outcomes.len() >= 5 {
+        profile.last_5_outcomes.remove(0);
+    }
+    profile.last_5_outcomes.push_back(outcome);
 }
 
 #[cfg(test)]

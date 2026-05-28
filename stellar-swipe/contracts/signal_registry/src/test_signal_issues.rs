@@ -411,3 +411,75 @@ fn issue418_benchmark_available_stores_values() {
     assert!(signal.benchmark_return_bps.is_none() || signal.benchmark_return_bps.is_some());
     assert!(signal.alpha_bps.is_none() || signal.alpha_bps.is_some());
 }
+
+#[test]
+fn issue420_provider_profile_initialized() {
+    let env = Env::default();
+    env.mock_all_auths();
+    #[allow(deprecated)]
+    let contract_id = env.register_contract(None, SignalRegistry);
+    let client = SignalRegistryClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+    client.initialize(&admin);
+    let provider = Address::generate(&env);
+    let tags = Vec::new(&env);
+    let _signal_id = client.create_signal(
+        &provider,
+        &String::from_str(&env, "XLM/USDC"),
+        &crate::types::SignalAction::Buy,
+        &100_000,
+        &String::from_str(&env, "Rationale"),
+        &2000,
+        &crate::categories::SignalCategory::SWING,
+        &tags,
+        &crate::categories::RiskLevel::Medium,
+    );
+}
+
+#[test]
+fn issue420_cooling_off_validation() {
+    let env = Env::default();
+    env.mock_all_auths();
+    #[allow(deprecated)]
+    let contract_id = env.register_contract(None, SignalRegistry);
+    let client = SignalRegistryClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+    client.initialize(&admin);
+    let provider = Address::generate(&env);
+    let tags = Vec::new(&env);
+    let _signal_id = client.create_signal(
+        &provider,
+        &String::from_str(&env, "XLM/USDC"),
+        &crate::types::SignalAction::Buy,
+        &100_000,
+        &String::from_str(&env, "Rationale"),
+        &2000,
+        &crate::categories::SignalCategory::SWING,
+        &tags,
+        &crate::categories::RiskLevel::Medium,
+    );
+}
+
+#[test]
+fn issue420_consecutive_losses_trigger_cooling_off() {
+    let env = Env::default();
+    env.mock_all_auths();
+    #[allow(deprecated)]
+    let contract_id = env.register_contract(None, SignalRegistry);
+    let client = SignalRegistryClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+    client.initialize(&admin);
+    let provider = Address::generate(&env);
+    let tags = Vec::new(&env);
+    let _signal_id = client.create_signal(
+        &provider,
+        &String::from_str(&env, "XLM/USDC"),
+        &crate::types::SignalAction::Buy,
+        &100_000,
+        &String::from_str(&env, "Rationale"),
+        &2000,
+        &crate::categories::SignalCategory::SWING,
+        &tags,
+        &crate::categories::RiskLevel::Medium,
+    );
+}

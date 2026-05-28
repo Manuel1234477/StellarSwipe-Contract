@@ -368,3 +368,13 @@ pub fn emit_signal_expiry_warning(
     env.events()
         .publish(topics, (signal_id, provider, expires_at, time_remaining_ledgers));
 }
+
+pub fn emit_provider_cooling_off_started(
+    env: &Env,
+    provider: Address,
+    ends_at: u64,
+) {
+    let topics = (Symbol::new(env, "provider_cooling_off"),);
+    env.events()
+        .publish(topics, (provider, ends_at));
+}

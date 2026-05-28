@@ -158,6 +158,21 @@ pub struct ProviderPerformance {
 }
 
 #[contracttype]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Outcome {
+    Win,
+    Loss,
+}
+
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct ProviderProfile {
+    pub provider: Address,
+    pub last_5_outcomes: Vec<Outcome>,
+    pub cooling_off_ends_at: u64,
+}
+
+#[contracttype]
 #[derive(Clone)]
 pub enum FeeStorageKey {
     PlatformTreasury,
