@@ -127,6 +127,7 @@ pub enum AdminStorageKey {
     CircuitBreakerConfig,
     PendingAdmin,
     PendingAdminExpiry,
+    PreventSelfDestruct,
 }
 
 pub fn init_admin(env: &Env, admin: Address) {
@@ -136,6 +137,11 @@ pub fn init_admin(env: &Env, admin: Address) {
     env.storage()
         .instance()
         .set(&AdminStorageKey::Admin, &admin);
+
+    // Self-destruct protection enabled by default.
+    env.storage()
+        .instance()
+        .set(&AdminStorageKey::PreventSelfDestruct, &true);
 
     let states: Map<String, PauseState> = Map::new(env);
     env.storage()
@@ -496,5 +502,34 @@ pub fn cancel_admin_transfer(env: &Env, caller: &Address) -> Result<(), AutoTrad
     env.storage().instance().remove(&AdminStorageKey::PendingAdmin);
     env.storage().instance().remove(&AdminStorageKey::PendingAdminExpiry);
 
+    Ok(())
+}
+
+// ==================== Self-Destruct Protection ====================
+
+pub fn is_self_destruct_protected(env: &Env) -> bool {
+    env.storage()
+        .instance()
+        .get(&AdminStorageKey::PreventSelfDestruct)
+        .unwrap_or(true)
+}
+
+pub fn require_self_destruct_allowed(env: &Env) -> Result<(), AutoTradeError> {
+    if is_self_destruct_protected(env) {
+        return Err(AutoTradeError::Unauthorized);
+    }
+    Ok(())
+}
+
+/// Governance-only: disable self-destruct protection.
+pub fn disable_self_destruct_protection(
+    env: &Env,
+    caller: &Address,
+) -> Result<(), AutoTradeError> {
+    require_admin(env, caller)?;
+    caller.require_auth();
+    env.storage()
+        .instance()
+        .set(&AdminStorageKey::PreventSelfDestruct, &false);
     Ok(())
 }

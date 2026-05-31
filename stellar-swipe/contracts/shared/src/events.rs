@@ -564,6 +564,48 @@ pub fn emit_streak_broken(env: &Env, evt: EvtStreakBroken) {
     );
 }
 
+// ── Data access audit events (Issue: access logging) ────────────────────────
+
+/// Sensitive data types that trigger an access log event.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum DataType {
+    UserPortfolio,
+    StakeBalance,
+    ProviderProfile,
+}
+
+/// Emitted when an external caller reads sensitive storage.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EvtDataAccessed {
+    pub schema_version: u32,
+    pub accessor: Address,
+    pub data_type: DataType,
+    pub owner: Address,
+    pub timestamp: u64,
+}
+
+/// Emit a `DataAccessed` event for an external read of sensitive data.
+///
+/// Call this only from public entry-points (not from internal helpers) so that
+/// internal reads do not produce spurious audit events.
+pub fn emit_data_accessed(env: &Env, accessor: Address, data_type: DataType, owner: Address) {
+    env.events().publish(
+        (
+            Symbol::new(env, "audit"),
+            Symbol::new(env, "data_accessed"),
+        ),
+        EvtDataAccessed {
+            schema_version: SCHEMA_VERSION,
+            accessor,
+            data_type,
+            owner,
+            timestamp: env.ledger().timestamp(),
+        },
+    );
+}
+
 // ── Event deduplication guard ─────────────────────────────────────────────────
 
 /// Discriminant for events that may be emitted more than once per entity.
@@ -1050,6 +1092,41 @@ mod tests {
                     timestamp: env.ledger().timestamp(),
                 },
             );
+            assert_eq!(env.events().all().len(), 1);
+        });
+    }
+
+    // ── DataAccessed event tests ───────────────────────────────────────────────
+
+    #[test]
+    fn emit_data_accessed_emits_event_with_all_fields() {
+        let (env, contract_id) = setup();
+        let accessor = soroban_sdk::Address::generate(&env);
+        let owner = soroban_sdk::Address::generate(&env);
+        env.as_contract(&contract_id, || {
+            emit_data_accessed(&env, accessor.clone(), DataType::UserPortfolio, owner.clone());
+            assert_eq!(env.events().all().len(), 1);
+        });
+    }
+
+    #[test]
+    fn emit_data_accessed_stake_balance() {
+        let (env, contract_id) = setup();
+        let accessor = soroban_sdk::Address::generate(&env);
+        let owner = soroban_sdk::Address::generate(&env);
+        env.as_contract(&contract_id, || {
+            emit_data_accessed(&env, accessor.clone(), DataType::StakeBalance, owner.clone());
+            assert_eq!(env.events().all().len(), 1);
+        });
+    }
+
+    #[test]
+    fn emit_data_accessed_provider_profile() {
+        let (env, contract_id) = setup();
+        let accessor = soroban_sdk::Address::generate(&env);
+        let owner = soroban_sdk::Address::generate(&env);
+        env.as_contract(&contract_id, || {
+            emit_data_accessed(&env, accessor.clone(), DataType::ProviderProfile, owner.clone());
             assert_eq!(env.events().all().len(), 1);
         });
     }

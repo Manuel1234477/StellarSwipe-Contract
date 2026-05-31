@@ -99,6 +99,11 @@ pub fn init_admin(env: &Env, admin: Address) -> Result<(), AdminError> {
         .instance()
         .set(&AdminStorageKey::MultiSigEnabled, &false);
 
+    // Self-destruct protection enabled by default.
+    env.storage()
+        .instance()
+        .set(&AdminStorageKey::PreventSelfDestruct, &true);
+
     let states: Map<String, PauseState> = Map::new(env);
     env.storage()
         .instance()
@@ -889,4 +894,37 @@ pub fn update_circuit_breaker_stats(env: &Env, failed: bool, volume: i128, price
             emit_circuit_breaker_triggered(env, String::from_str(env, CAT_ALL), reason);
         }
     }
+}
+
+// ==================== Self-Destruct Protection ====================
+
+/// Returns `true` when the contract deletion guard is active.
+pub fn is_self_destruct_protected(env: &Env) -> bool {
+    env.storage()
+        .instance()
+        .get(&AdminStorageKey::PreventSelfDestruct)
+        .unwrap_or(true) // safe default: protected
+}
+
+/// Block any operation that would delete the contract while protection is on.
+/// Returns `Err(AdminError::Unauthorized)` if protection is enabled.
+pub fn require_self_destruct_allowed(env: &Env) -> Result<(), AdminError> {
+    if is_self_destruct_protected(env) {
+        return Err(AdminError::Unauthorized);
+    }
+    Ok(())
+}
+
+/// Governance-only: disable self-destruct protection so the contract can be
+/// deleted after a successful governance proposal.
+pub fn disable_self_destruct_protection(
+    env: &Env,
+    caller: &Address,
+) -> Result<(), AdminError> {
+    require_admin(env, caller)?;
+    caller.require_auth();
+    env.storage()
+        .instance()
+        .set(&AdminStorageKey::PreventSelfDestruct, &false);
+    Ok(())
 }
