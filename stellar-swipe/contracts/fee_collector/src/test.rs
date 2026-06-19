@@ -1125,3 +1125,137 @@ fn test_withdraw_timelock_timestamp_overflow() {
     let result = client.try_withdraw_treasury_fees(&recipient, &token, &1000i128);
     assert_eq!(result, Err(Ok(ContractError::ArithmeticOverflow)));
 }
+
+// ---------------------------------------------------------------------------
+// audit_balances — reconciliation tests
+// ---------------------------------------------------------------------------
+
+/// Helper: set up contract with a token and matching on-chain + stored balances.
+fn setup_audit(env: &Env, amount: i128) -> (Address, Address, FeeCollectorClient<'_>) {
+    let admin = Address::generate(env);
+    let token_admin = Address::generate(env);
+    let token = env
+        .register_stellar_asset_contract_v2(token_admin)
+        .address();
+    let contract_id = env.register(FeeCollector, ());
+    let client = FeeCollectorClient::new(env, &contract_id);
+    client.initialize(&admin);
+    StellarAssetClient::new(env, &token).mint(&contract_id, &amount);
+    env.as_contract(&contract_id, || {
+        set_treasury_balance(env, &token, amount);
+    });
+    (token, contract_id, client)
+}
+
+#[test]
+fn test_audit_balances_no_mismatch() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (token, _contract_id, client) = setup_audit(&env, 1_000i128);
+
+    let tokens = soroban_sdk::vec![&env, token.clone()];
+    let mismatches = client.audit_balances(&tokens).unwrap();
+
+    // Stored balance equals on-chain balance: no mismatches
+    assert_eq!(mismatches.len(), 0);
+}
+
+#[test]
+fn test_audit_balances_detects_surplus() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (token, contract_id, client) = setup_audit(&env, 1_000i128);
+
+    // Mint extra tokens directly to the contract without updating stored balance
+    StellarAssetClient::new(&env, &token).mint(&contract_id, &500i128);
+
+    let tokens = soroban_sdk::vec![&env, token.clone()];
+    let mismatches = client.audit_balances(&tokens).unwrap();
+
+    assert_eq!(mismatches.len(), 1);
+    let m = mismatches.get(0).unwrap();
+    assert_eq!(m.token, token);
+    assert_eq!(m.expected, 1_000);
+    assert_eq!(m.actual, 1_500);
+    assert_eq!(m.delta, 500); // surplus
+}
+
+#[test]
+fn test_audit_balances_detects_deficit() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (token, contract_id, client) = setup_audit(&env, 1_000i128);
+
+    // Artificially inflate the stored balance to simulate a deficit
+    env.as_contract(&contract_id, || {
+        set_treasury_balance(&env, &token, 2_000i128);
+    });
+
+    let tokens = soroban_sdk::vec![&env, token.clone()];
+    let mismatches = client.audit_balances(&tokens).unwrap();
+
+    assert_eq!(mismatches.len(), 1);
+    let m = mismatches.get(0).unwrap();
+    assert_eq!(m.expected, 2_000);
+    assert_eq!(m.actual, 1_000);
+    assert_eq!(m.delta, -1_000); // deficit
+}
+
+#[test]
+fn test_audit_balances_multiple_tokens() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let contract_id = env.register(FeeCollector, ());
+    let client = FeeCollectorClient::new(&env, &contract_id);
+    client.initialize(&admin);
+
+    // Token A: balanced
+    let token_a = env
+        .register_stellar_asset_contract_v2(Address::generate(&env))
+        .address();
+    StellarAssetClient::new(&env, &token_a).mint(&contract_id, &500i128);
+    env.as_contract(&contract_id, || {
+        set_treasury_balance(&env, &token_a, 500i128);
+    });
+
+    // Token B: stored says 300, actual is 400 (surplus)
+    let token_b = env
+        .register_stellar_asset_contract_v2(Address::generate(&env))
+        .address();
+    StellarAssetClient::new(&env, &token_b).mint(&contract_id, &400i128);
+    env.as_contract(&contract_id, || {
+        set_treasury_balance(&env, &token_b, 300i128);
+    });
+
+    let tokens = soroban_sdk::vec![&env, token_a.clone(), token_b.clone()];
+    let mismatches = client.audit_balances(&tokens).unwrap();
+
+    // Only token B should appear
+    assert_eq!(mismatches.len(), 1);
+    let m = mismatches.get(0).unwrap();
+    assert_eq!(m.token, token_b);
+    assert_eq!(m.expected, 300);
+    assert_eq!(m.actual, 400);
+    assert_eq!(m.delta, 100);
+}
+
+#[test]
+fn test_audit_balances_not_initialized() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let token = env
+        .register_stellar_asset_contract_v2(Address::generate(&env))
+        .address();
+    let contract_id = env.register(FeeCollector, ());
+    let client = FeeCollectorClient::new(&env, &contract_id);
+
+    let tokens = soroban_sdk::vec![&env, token.clone()];
+    let result = client.try_audit_balances(&tokens);
+    assert_eq!(result, Err(Ok(ContractError::NotInitialized)));
+}

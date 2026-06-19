@@ -29,12 +29,13 @@ use storage::{
     set_fee_optimization_config, set_failed_fee_collection, set_has_traded, set_initialized,
     set_monthly_trade_volume, set_network_condition_score,
     set_oracle_contract as set_oracle_contract_storage, set_pending_fees, set_queued_withdrawal,
-    set_treasury_balance, ErrorReport, FailedFeeCollection, FeeOptimizationConfig,
+    set_treasury_balance, BalanceMismatch, ErrorReport, FailedFeeCollection, FeeOptimizationConfig,
     MonthlyTradeVolume, QueuedWithdrawal, StorageKey, MAX_BURN_RATE_BPS, MAX_FEE_RATE_BPS,
     MIN_FEE_RATE_BPS,
 };
+pub use storage::BalanceMismatch;
 
-use soroban_sdk::{contract, contractimpl, token, Address, Env, String};
+use soroban_sdk::{contract, contractimpl, token, Address, Env, String, Vec};
 
 use shared::errors::{ErrorCategory, RecoveryStrategy};
 use stellar_swipe_common::Asset;
@@ -164,6 +165,46 @@ impl FeeCollector {
             return Err(ContractError::NotInitialized);
         }
         Ok(get_treasury_balance(&env, &token))
+    }
+
+    /// # Summary
+    /// Read-only audit that compares the stored treasury balance against the
+    /// contract's actual on-chain token balance for each supplied token.
+    ///
+    /// Call this off-chain (via `simulateTransaction`) or from monitoring
+    /// scripts after unusual activity to detect accounting discrepancies.
+    ///
+    /// # Parameters
+    /// - `env`: Soroban environment.
+    /// - `tokens`: List of SEP-41 token addresses to audit.
+    ///
+    /// # Returns
+    /// A `Vec<BalanceMismatch>` containing one entry per token where
+    /// `actual != expected`. Returns an empty vec when all balances reconcile.
+    ///
+    /// # Errors
+    /// - [`ContractError::NotInitialized`] if the contract has not been initialized.
+    pub fn audit_balances(
+        env: Env,
+        tokens: Vec<Address>,
+    ) -> Result<Vec<BalanceMismatch>, ContractError> {
+        if !is_initialized(&env) {
+            return Err(ContractError::NotInitialized);
+        }
+        let mut mismatches = Vec::new(&env);
+        for token in tokens.iter() {
+            let expected = get_treasury_balance(&env, &token);
+            let actual = token::Client::new(&env, &token).balance(&env.current_contract_address());
+            if actual != expected {
+                mismatches.push_back(BalanceMismatch {
+                    token: token.clone(),
+                    expected,
+                    actual,
+                    delta: actual.saturating_sub(expected),
+                });
+            }
+        }
+        Ok(mismatches)
     }
 
     /// # Summary

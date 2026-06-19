@@ -103,6 +103,21 @@ pub struct MonthlyTradeVolume {
     pub volume_usd: i128,
 }
 
+/// Describes a discrepancy between the contract's stored treasury balance
+/// and the actual on-chain token balance for a given token.
+#[contracttype]
+#[derive(Clone)]
+pub struct BalanceMismatch {
+    /// The token whose balances were compared.
+    pub token: Address,
+    /// Balance recorded in contract storage (`TreasuryBalance`).
+    pub expected: i128,
+    /// Actual token balance held by this contract on-chain.
+    pub actual: i128,
+    /// Difference: `actual - expected`. Positive means surplus, negative means deficit.
+    pub delta: i128,
+}
+
 // --- Admin ---
 
 pub fn get_admin(env: &Env) -> Address {
