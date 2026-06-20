@@ -54,6 +54,7 @@ pub enum GovernanceError {
     ActionNotFound = 48,
     InvalidTimelockConfig = 49,
     ConvictionPoolNotFound = 50,
+ feat/treasury-budget-caps
     /// Fewer eligible voters participated in a committee election than the
     /// configured minimum quorum requires.  The election is voided and the
     /// committee keeps its existing members.
@@ -69,4 +70,7 @@ pub enum GovernanceError {
     /// The requested spend would cause the category's total governance-approved
     /// cap to be exceeded.
     ApprovedCapExceeded = 54,
+
+    InvalidCalibrationConfig = 51,
+main
 }
