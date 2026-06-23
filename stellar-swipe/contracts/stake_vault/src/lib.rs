@@ -3,7 +3,9 @@
 pub mod migration;
 
 use migration::{MigrationKey, StakeInfoV2};
-use soroban_sdk::{contract, contractimpl, contracttype, contracterror, token, Address, Env, Symbol};
+use soroban_sdk::{
+    contract, contracterror, contractimpl, contracttype, token, Address, Env, Symbol,
+};
 
 /// Temporary-storage key for the reentrancy lock on `withdraw_stake`.
 const EXECUTION_LOCK: &str = "WithdrawLock";
@@ -81,17 +83,17 @@ pub enum StorageKey {
 #[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
 #[repr(u32)]
 pub enum StakeVaultError {
-    NotInitialized    = 1,
-    Unauthorized      = 2,
-    NoStake           = 3,
-    StakeLocked       = 4,
+    NotInitialized = 1,
+    Unauthorized = 2,
+    NoStake = 3,
+    StakeLocked = 4,
     ReentrancyDetected = 5,
     /// Provider stake is below minimum and grace period has expired.
     StakeBelowMinimum = 6,
     /// Contract is paused due to suspicious activity or admin action.
-    ContractPaused    = 7,
+    ContractPaused = 7,
     /// Large withdrawal requires a pending time-lock request first.
-    TimelockRequired  = 8,
+    TimelockRequired = 8,
     /// Time-lock period has not yet elapsed.
     TimelockNotElapsed = 9,
     /// Stake and unstake in the same ledger — flash loan pattern detected.
@@ -109,8 +111,12 @@ impl StakeVaultContract {
             panic!("already initialized");
         }
         env.storage().instance().set(&StorageKey::Admin, &admin);
-        env.storage().instance().set(&StorageKey::StakeToken, &stake_token);
-        env.storage().instance().set(&StorageKey::SignalRegistry, &signal_registry);
+        env.storage()
+            .instance()
+            .set(&StorageKey::StakeToken, &stake_token);
+        env.storage()
+            .instance()
+            .set(&StorageKey::SignalRegistry, &signal_registry);
         env.storage().instance().set(&StorageKey::Paused, &false);
     }
 
@@ -126,7 +132,10 @@ impl StakeVaultContract {
         admin.require_auth();
         env.storage().instance().set(&StorageKey::Paused, &true);
         env.events().publish(
-            (Symbol::new(&env, "stake_vault"), Symbol::new(&env, "paused")),
+            (
+                Symbol::new(&env, "stake_vault"),
+                Symbol::new(&env, "paused"),
+            ),
             (),
         );
     }
@@ -141,7 +150,10 @@ impl StakeVaultContract {
         admin.require_auth();
         env.storage().instance().set(&StorageKey::Paused, &false);
         env.events().publish(
-            (Symbol::new(&env, "stake_vault"), Symbol::new(&env, "unpaused")),
+            (
+                Symbol::new(&env, "stake_vault"),
+                Symbol::new(&env, "unpaused"),
+            ),
             (),
         );
     }
@@ -339,9 +351,10 @@ impl StakeVaultContract {
         }
 
         let now = env.ledger().timestamp();
-        env.storage()
-            .persistent()
-            .set(&StorageKey::LargeWithdrawalRequestedAt(staker.clone()), &now);
+        env.storage().persistent().set(
+            &StorageKey::LargeWithdrawalRequestedAt(staker.clone()),
+            &now,
+        );
 
         env.events().publish(
             (

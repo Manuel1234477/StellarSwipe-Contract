@@ -1102,21 +1102,22 @@ impl AutoTradeContract {
         admin::is_rate_limited(&env, &user)
     }
 
-fn failed_simulation(env: &Env, reason: &str) -> TradeSimulation {
-    logging::emit_log(
-        env,
-        logging::LogLevel::Warn,
-        String::from_str(env, "simulation"),
-        String::from_str(env, reason),
-        None,
-    );
-    TradeSimulation {
-        expected_output: 0,
-        fee_amount: 0,
-        slippage_bps: 0,
-        price_impact_bps: 0,
-        would_succeed: false,
-        failure_reason: Some(String::from_str(env, reason)),
+    fn failed_simulation(env: &Env, reason: &str) -> TradeSimulation {
+        logging::emit_log(
+            env,
+            logging::LogLevel::Warn,
+            String::from_str(env, "simulation"),
+            String::from_str(env, reason),
+            None,
+        );
+        TradeSimulation {
+            expected_output: 0,
+            fee_amount: 0,
+            slippage_bps: 0,
+            price_impact_bps: 0,
+            would_succeed: false,
+            failure_reason: Some(String::from_str(env, reason)),
+        }
     }
 
     /// Returns estimated storage usage metrics.

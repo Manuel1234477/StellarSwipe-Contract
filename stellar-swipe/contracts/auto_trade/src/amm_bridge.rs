@@ -126,7 +126,7 @@ pub fn discover_quotes(env: &Env, signal_id: u64, probe_amount: i128) -> Vec<Amm
     let mut quotes = Vec::new(env);
 
     for venue in smart_routing::get_venue_liquidity(env, signal_id).iter() {
-        if let Ok(q) = quote_from_venue(venue, probe_amount) {
+        if let Ok(q) = quote_from_venue(&venue, probe_amount) {
             emit_quote_discovered(env, signal_id, &q);
             quotes.push_back(q);
         }
@@ -242,7 +242,7 @@ fn execute_amm_plan(
     }
 
     for segment in plan.segments.iter() {
-        execute_segment(env, signal_id, segment)?;
+        execute_segment(env, signal_id, &segment)?;
     }
 
     Ok(ExecutionResult {

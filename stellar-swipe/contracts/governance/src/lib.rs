@@ -16,11 +16,11 @@ mod voting;
 #[cfg(test)]
 mod test;
 #[cfg(test)]
+mod test_committee_elections;
+#[cfg(test)]
 mod test_health;
 #[cfg(test)]
 mod test_pause_propagation;
-#[cfg(test)]
-mod test_committee_elections;
 
 use committees::{
     list_committees as list_registered_committees, CommitteeAction, CommitteeElection,

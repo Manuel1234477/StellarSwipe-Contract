@@ -3,6 +3,7 @@
 use crate::admin::require_admin;
 use crate::errors::AutoTradeError;
 use shared::events::{emit_kyc_status_updated, EvtKycStatusUpdated, SCHEMA_VERSION};
+use soroban_sdk::{contracttype, Address, Env, String, Symbol};
 
 #[contracttype]
 #[derive(Clone, Debug, PartialEq, Eq)]

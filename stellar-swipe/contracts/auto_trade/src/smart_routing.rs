@@ -257,7 +257,6 @@ pub fn execute_plan_atomically(
     })
 }
 
-#[cfg(test)]
 pub fn set_execution_failure(env: &Env, signal_id: u64, venue: LiquidityVenue, venue_id: u32) {
     env.storage().temporary().set(
         &SmartRoutingKey::FailVenue(signal_id),

@@ -18,8 +18,7 @@
 //! filled / failed) updated on every `execute_trade` outcome, queryable via
 //! `get_trade_metrics` for a cheap on-chain success-rate signal.
 
-use soroban_sdk::{contracttype, Address, Env, String, Symbol, Vec};
-use crate::admin::{require_admin};
+use crate::admin::require_admin;
 use crate::errors::AutoTradeError;
 use soroban_sdk::{contracttype, Address, Env, String, Symbol, Vec};
 
