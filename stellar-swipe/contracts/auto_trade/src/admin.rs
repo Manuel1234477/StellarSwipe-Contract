@@ -8,6 +8,8 @@ use crate::storage::{self, RateLimitInfo};
 
 /// 1 hour in seconds (3600 seconds)
 pub const RATE_LIMIT_DURATION_SECONDS: u64 = 3600;
+/// 48 hours in seconds
+const PENDING_ADMIN_EXPIRY_LEDGERS: u64 = 48 * 60 * 60;
 
 #[contracttype]
 pub enum AdminStorageKey {
@@ -25,48 +27,32 @@ pub enum AdminStorageKey {
     PreventSelfDestruct,
 }
 
-pub fn init_admin(env: &Env, admin: Address) {
-    if env.storage().instance().has(&AdminStorageKey::Admin) {
-        panic!("Already initialized");
-    }
-    env.storage()
-        .instance()
-        .set(&AdminStorageKey::Admin, &admin);
-
-    // Self-destruct protection enabled by default.
-    env.storage()
-        .instance()
-        .set(&AdminStorageKey::PreventSelfDestruct, &true);
-
-    let states: Map<String, PauseState> = Map::new(env);
-    env.storage()
-        .instance()
-        .set(&AdminStorageKey::PauseStates, &states);
-
-    let stats = CircuitBreakerStats {
-        attempts_window: 0,
-        failures_window: 0,
-        window_start: env.ledger().timestamp(),
-        volume_1h: 0,
-        volume_24h_avg: 0,
-        last_price: 0,
-        last_price_time: 0,
+pub fn clear_rate_limited(
+    env: &Env,
+    caller: &Address,
+    user: &Address,
+) -> Result<(), AutoTradeError> {
+    require_operator(env, caller)?;
+    let info = RateLimitInfo {
+        user: user.clone(),
+        is_limited: false,
+        expires_at: 0,
     };
-    env.storage()
-        .instance()
-        .set(&AdminStorageKey::CircuitBreakerStats, &stats);
-}
-
-pub fn get_admin(env: &Env) -> Option<Address> {
-    env.storage().instance().get(&AdminStorageKey::Admin)
-}
-
-pub fn require_admin(env: &Env, caller: &Address) -> Result<(), AutoTradeError> {
-    let admin = get_admin(env).ok_or(AutoTradeError::Unauthorized)?;
-    if caller != &admin {
-        return Err(AutoTradeError::Unauthorized);
-    }
+    storage::set_rate_limit_info(env, user, &info);
+    #[allow(deprecated)]
+    env.events().publish(
+        (Symbol::new(env, "user_rate_limit_cleared"), user.clone()),
+        caller.clone(),
+    );
     Ok(())
+}
+
+pub fn get_rate_limit_info(env: &Env, user: &Address) -> Option<RateLimitInfo> {
+    storage::get_rate_limit_info(env, user)
+}
+
+pub fn is_rate_limited(env: &Env, user: &Address) -> bool {
+    storage::is_rate_limited(env, user)
 }
 
 /// Get current operator
@@ -108,8 +94,11 @@ pub fn require_operator(env: &Env, caller: &Address) -> Result<(), AutoTradeErro
 pub fn set_guardian(env: &Env, caller: &Address, guardian: Address) -> Result<(), AutoTradeError> {
     require_admin(env, caller)?;
     caller.require_auth();
-    env.storage().instance().set(&AdminStorageKey::Guardian, &guardian);
-    env.events().publish((soroban_sdk::Symbol::new(env, "guardian_set"),), guardian);
+    env.storage()
+        .instance()
+        .set(&AdminStorageKey::Guardian, &guardian);
+    env.events()
+        .publish((Symbol::new(env, "guardian_set"),), guardian);
     Ok(())
 }
 
@@ -122,7 +111,8 @@ pub fn revoke_guardian(env: &Env, caller: &Address) -> Result<(), AutoTradeError
         .get(&AdminStorageKey::Guardian)
         .ok_or(AutoTradeError::Unauthorized)?;
     env.storage().instance().remove(&AdminStorageKey::Guardian);
-    env.events().publish((soroban_sdk::Symbol::new(env, "guardian_revoked"),), guardian);
+    env.events()
+        .publish((Symbol::new(env, "guardian_revoked"),), guardian);
     Ok(())
 }
 
@@ -150,7 +140,6 @@ pub fn pause_category(
 
     let now = env.ledger().timestamp();
     let auto_unpause_at = duration.map(|d| now + d);
-
     let pause_state = PauseState {
         paused: true,
         paused_at: now,
@@ -163,7 +152,6 @@ pub fn pause_category(
     env.storage()
         .instance()
         .set(&AdminStorageKey::PauseStates, &states);
-
     Ok(())
 }
 
@@ -174,7 +162,6 @@ pub fn unpause_category(
 ) -> Result<(), AutoTradeError> {
     require_admin(env, caller)?;
     caller.require_auth();
-
     let mut states = get_pause_states(env);
     if states.contains_key(category.clone()) {
         states.remove(category.clone());
@@ -194,17 +181,14 @@ pub fn get_pause_states(env: &Env) -> Map<String, PauseState> {
 
 pub fn is_paused(env: &Env, category: String) -> bool {
     let states = get_pause_states(env);
-
     if let Some(all_pause) = states.get(String::from_str(env, CAT_ALL)) {
         if is_state_active(env, &all_pause) {
             return true;
         }
     }
-
     if let Some(pause) = states.get(category) {
         return is_state_active(env, &pause);
     }
-
     false
 }
 
@@ -288,20 +272,14 @@ pub fn update_cb_stats(env: &Env, failed: bool, volume: i128, price: i128) {
             env.storage()
                 .instance()
                 .set(&AdminStorageKey::PauseStates, &states);
-
             env.events().publish(
-                (soroban_sdk::Symbol::new(env, "circuit_breaker_triggered"),),
+                (Symbol::new(env, "circuit_breaker_triggered"),),
                 reason,
             );
         }
     }
 }
 
-// ==================== Two-Step Admin Transfer ====================
-// 48 hours in seconds (using ledger seconds)
-const PENDING_ADMIN_EXPIRY_LEDGERS: u64 = 48 * 60 * 60;
-
-/// Propose a new admin (requires current admin)
 pub fn propose_admin_transfer(
     env: &Env,
     caller: &Address,
@@ -312,8 +290,6 @@ pub fn propose_admin_transfer(
 
     let now = env.ledger().timestamp();
     let expires_at = now + PENDING_ADMIN_EXPIRY_LEDGERS;
-
-    // Store pending admin and expiry time
     env.storage()
         .instance()
         .set(&AdminStorageKey::PendingAdmin, &new_admin);
@@ -321,36 +297,30 @@ pub fn propose_admin_transfer(
         .instance()
         .set(&AdminStorageKey::PendingAdminExpiry, &expires_at);
 
-    // Emit event
     env.events().publish(
         (
-            soroban_sdk::Symbol::new(env, "admin_transfer_proposed"),
+            Symbol::new(env, "admin_transfer_proposed"),
             caller.clone(),
             new_admin,
         ),
         expires_at,
     );
-
     Ok(())
 }
 
 /// Accept admin transfer (called by new admin)
 pub fn accept_admin_transfer(env: &Env, caller: &Address) -> Result<(), AutoTradeError> {
     caller.require_auth();
-
-    // Get current pending admin
     let pending_admin: Address = env
         .storage()
         .instance()
         .get(&AdminStorageKey::PendingAdmin)
         .ok_or(AutoTradeError::PendingAdminNotFound)?;
 
-    // Verify caller is the pending admin
     if caller != &pending_admin {
         return Err(AutoTradeError::Unauthorized);
     }
 
-    // Check if transfer has expired
     let expires_at: u64 = env
         .storage()
         .instance()
@@ -359,34 +329,30 @@ pub fn accept_admin_transfer(env: &Env, caller: &Address) -> Result<(), AutoTrad
 
     let now = env.ledger().timestamp();
     if now >= expires_at {
-        // Clean up expired transfer
         env.storage().instance().remove(&AdminStorageKey::PendingAdmin);
-        env.storage().instance().remove(&AdminStorageKey::PendingAdminExpiry);
+        env.storage()
+            .instance()
+            .remove(&AdminStorageKey::PendingAdminExpiry);
         return Err(AutoTradeError::PendingAdminExpired);
     }
 
-    // Get old admin for event
     let old_admin = get_admin(env).ok_or(AutoTradeError::Unauthorized)?;
-
-    // Complete the transfer
     env.storage()
         .instance()
         .set(&AdminStorageKey::Admin, &pending_admin);
-
-    // Clean up pending admin entries
     env.storage().instance().remove(&AdminStorageKey::PendingAdmin);
-    env.storage().instance().remove(&AdminStorageKey::PendingAdminExpiry);
+    env.storage()
+        .instance()
+        .remove(&AdminStorageKey::PendingAdminExpiry);
 
-    // Emit completion event
     env.events().publish(
         (
-            soroban_sdk::Symbol::new(env, "admin_transfer_completed"),
+            Symbol::new(env, "admin_transfer_completed"),
             old_admin,
             pending_admin,
         ),
         (),
     );
-
     Ok(())
 }
 
@@ -394,18 +360,15 @@ pub fn accept_admin_transfer(env: &Env, caller: &Address) -> Result<(), AutoTrad
 pub fn cancel_admin_transfer(env: &Env, caller: &Address) -> Result<(), AutoTradeError> {
     require_admin(env, caller)?;
     caller.require_auth();
-
-    // Check if there's a pending transfer
-    let _pending_admin: Address = env
+    let _pending: Address = env
         .storage()
         .instance()
         .get(&AdminStorageKey::PendingAdmin)
         .ok_or(AutoTradeError::PendingAdminNotFound)?;
-
-    // Remove pending transfer
     env.storage().instance().remove(&AdminStorageKey::PendingAdmin);
-    env.storage().instance().remove(&AdminStorageKey::PendingAdminExpiry);
-
+    env.storage()
+        .instance()
+        .remove(&AdminStorageKey::PendingAdminExpiry);
     Ok(())
 }
 
@@ -492,7 +455,6 @@ pub fn require_self_destruct_allowed(env: &Env) -> Result<(), AutoTradeError> {
     Ok(())
 }
 
-/// Governance-only: disable self-destruct protection.
 pub fn disable_self_destruct_protection(
     env: &Env,
     caller: &Address,

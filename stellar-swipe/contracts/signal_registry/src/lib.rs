@@ -29,10 +29,12 @@ mod templates;
 mod test_reputation;
 mod types;
 mod migration;
+mod multisig_approvals;
 mod validation;
 mod versioning;
 
 pub use categories::{RiskLevel, SignalCategory};
+pub use multisig_approvals::CriticalActionPayload;
 pub use types::SignalAction;
 pub use types::{FeeBreakdown, ProviderPerformance, SignalOutcome, SignalStatus};
 
@@ -70,6 +72,7 @@ use reputation::{
 };
 use soroban_sdk::{contract, contractimpl, contracttype, Address, Bytes, Env, Map, String, Vec};
 use stellar_swipe_common::{health_uninitialized, placeholder_admin, HealthStatus};
+use stellar_swipe_common::{ApprovalProposal, MultisigTimelockConfig, ProposalStatus};
 use stellar_swipe_common::{validate_asset_pair as validate_asset_pair_common, AssetPairError};
 pub use templates::{SignalTemplate, SignalTemplateOverrides, StoredSignalTemplate};
 use templates::{SignalTemplate, DEFAULT_TEMPLATE_EXPIRY_HOURS};
@@ -486,6 +489,57 @@ impl SignalRegistry {
     }
 
     /* =========================
+       MULTISIG APPROVAL WORKFLOW
+    ========================== */
+
+    /// Propose a critical admin action for M-of-N approval.
+    pub fn propose_critical_action(
+        env: Env,
+        caller: Address,
+        payload: multisig_approvals::CriticalActionPayload,
+    ) -> Result<u64, AdminError> {
+        multisig_approvals::propose_critical_action(&env, &caller, payload)
+    }
+
+    /// Approve a pending critical action proposal.
+    pub fn approve_proposal(
+        env: Env,
+        caller: Address,
+        proposal_id: u64,
+    ) -> Result<ProposalStatus, AdminError> {
+        multisig_approvals::approve_proposal(&env, &caller, proposal_id)
+    }
+
+    /// Cancel a pending or timelocked proposal.
+    pub fn cancel_proposal(env: Env, caller: Address, proposal_id: u64) -> Result<(), AdminError> {
+        multisig_approvals::cancel_proposal(&env, &caller, proposal_id)
+    }
+
+    /// Execute an approved proposal after the timelock elapses.
+    pub fn execute_proposal(env: Env, caller: Address, proposal_id: u64) -> Result<(), AdminError> {
+        multisig_approvals::execute_proposal(&env, &caller, proposal_id)
+    }
+
+    /// Read a proposal by id.
+    pub fn get_approval_proposal(env: Env, proposal_id: u64) -> Result<ApprovalProposal, AdminError> {
+        multisig_approvals::get_approval_proposal(&env, proposal_id)
+    }
+
+    /// Read timelock delay configuration for critical actions.
+    pub fn get_multisig_timelock_config(env: Env) -> MultisigTimelockConfig {
+        multisig_approvals::get_timelock_config(&env)
+    }
+
+    /// Update timelock delays (requires single-admin or direct signer when multisig disabled).
+    pub fn set_multisig_timelock_config(
+        env: Env,
+        caller: Address,
+        config: MultisigTimelockConfig,
+    ) -> Result<(), AdminError> {
+        multisig_approvals::set_timelock_config(&env, &caller, config)
+    }
+
+    /* =========================
        INTERNAL HELPERS
     ========================== */
 
@@ -785,6 +839,7 @@ impl SignalRegistry {
         let mut signals = Self::get_signals_map(env);
         signals.set(id, signal);
         Self::save_signals_map(env, &signals);
+        validation::increment_provider_active_count(env, &provider);
 
         // Update tag popularity
         categories::increment_tag_popularity(env, &unique_tags);
@@ -1313,6 +1368,10 @@ impl SignalRegistry {
         // Save updated signal
         signals.set(signal_id, signal.clone());
         Self::save_signals_map(&env, &signals);
+
+        if old_status == SignalStatus::Active && new_status != SignalStatus::Active {
+            validation::decrement_provider_active_count(&env, &signal.provider);
+        }
 
         let provider_for_contest = signal.provider.clone();
 
@@ -2693,6 +2752,10 @@ pub struct StorageStats {
 
 #[cfg(test)]
 mod test;
+#[cfg(test)]
+mod test;
+#[cfg(test)]
+mod test_multisig_approval;
 #[cfg(test)]
 mod test_adoption;
 #[cfg(test)]
