@@ -1712,9 +1712,7 @@ impl SignalRegistry {
 
         let provider = signal.provider.clone();
         let mut provider_stats_map = Self::get_provider_stats_map(&env);
-        let mut provider_stats = provider_stats_map
-            .get(provider.clone())
-            .unwrap_or_default();
+        let mut provider_stats = provider_stats_map.get(provider.clone()).unwrap_or_default();
         provider_stats.total_copies = provider_stats
             .total_copies
             .checked_add(1)
