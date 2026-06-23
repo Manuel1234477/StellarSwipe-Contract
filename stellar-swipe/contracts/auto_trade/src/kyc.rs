@@ -2,10 +2,7 @@
 
 use crate::admin::require_admin;
 use crate::errors::AutoTradeError;
-use soroban_sdk::{contracttype, Address, Env, String, Symbol};
-use stellar_swipe_common::shared::events::{
-    emit_kyc_status_updated, EvtKycStatusUpdated, SCHEMA_VERSION,
-};
+use shared::events::{emit_kyc_status_updated, EvtKycStatusUpdated, SCHEMA_VERSION};
 
 #[contracttype]
 #[derive(Clone, Debug, PartialEq, Eq)]

@@ -156,8 +156,10 @@ pub fn get_aggregated_price(env: &Env, asset_pair: u32) -> Result<OraclePrice, A
             let reason = match err {
                 OracleError::NotConfigured => String::from_str(env, "oracle_not_configured"),
                 OracleError::PriceNotFound => String::from_str(env, "price_not_found"),
-                OracleError::PriceStale => String::from_str(env, "price_stale"),
-                OracleError::CallFailed => String::from_str(env, "call_failed"),
+                OracleError::PriceStale    => String::from_str(env, "price_stale"),
+                OracleError::CallFailed    => String::from_str(env, "call_failed"),
+                OracleError::PriceBelowMin => String::from_str(env, "price_below_min"),
+                OracleError::PriceAboveMax => String::from_str(env, "price_above_max"),
             };
             env.events()
                 .publish((Symbol::new(env, "oracle_cb_triggered"),), reason);

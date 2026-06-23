@@ -6,122 +6,25 @@ use stellar_swipe_common::emergency::{
 use crate::errors::AutoTradeError;
 use crate::storage::{self, RateLimitInfo};
 
-/// Rate limit duration: 720 ledgers ≈ 1 hour (assuming 5-second block time)
-pub const RATE_LIMIT_DURATION_LEDGERS: u64 = 720;
-/// 1 hour in seconds
+/// 1 hour in seconds (3600 seconds)
 pub const RATE_LIMIT_DURATION_SECONDS: u64 = 3600;
 /// 48 hours in seconds
 const PENDING_ADMIN_EXPIRY_LEDGERS: u64 = 48 * 60 * 60;
 
 #[contracttype]
-#[derive(Clone)]
 pub enum AdminStorageKey {
     Admin,
     Operator,
     Guardian,
     OracleAddress,
     OracleCircuitBreaker,
-    OracleWhitelist(u32),
+    OracleWhitelist(u32), // keyed by asset_pair
     PauseStates,
     CircuitBreakerStats,
     CircuitBreakerConfig,
     PendingAdmin,
     PendingAdminExpiry,
     PreventSelfDestruct,
-}
-
-pub fn init_admin(env: &Env, admin: Address) {
-    if env.storage().instance().has(&AdminStorageKey::Admin) {
-        panic!("Already initialized");
-    }
-    env.storage()
-        .instance()
-        .set(&AdminStorageKey::Admin, &admin);
-    env.storage()
-        .instance()
-        .set(&AdminStorageKey::PreventSelfDestruct, &true);
-
-    let states: Map<String, PauseState> = Map::new(env);
-    env.storage()
-        .instance()
-        .set(&AdminStorageKey::PauseStates, &states);
-
-    let stats = CircuitBreakerStats {
-        attempts_window: 0,
-        failures_window: 0,
-        window_start: env.ledger().timestamp(),
-        volume_1h: 0,
-        volume_24h_avg: 0,
-        last_price: 0,
-        last_price_time: 0,
-    };
-    env.storage()
-        .instance()
-        .set(&AdminStorageKey::CircuitBreakerStats, &stats);
-}
-
-pub fn has_admin(env: &Env) -> bool {
-    env.storage().instance().has(&AdminStorageKey::Admin)
-}
-
-pub fn get_admin(env: &Env) -> Option<Address> {
-    env.storage().instance().get(&AdminStorageKey::Admin)
-}
-
-pub fn require_admin(env: &Env, caller: &Address) -> Result<(), AutoTradeError> {
-    let admin = get_admin(env).ok_or(AutoTradeError::Unauthorized)?;
-    if caller != &admin {
-        return Err(AutoTradeError::Unauthorized);
-    }
-    caller.require_auth();
-    Ok(())
-}
-
-pub fn get_operator(env: &Env) -> Result<Address, AutoTradeError> {
-    env.storage()
-        .instance()
-        .get(&AdminStorageKey::Operator)
-        .ok_or(AutoTradeError::Unauthorized)
-}
-
-pub fn set_operator(env: &Env, caller: &Address, operator: Address) -> Result<(), AutoTradeError> {
-    require_admin(env, caller)?;
-    env.storage()
-        .instance()
-        .set(&AdminStorageKey::Operator, &operator);
-    #[allow(deprecated)]
-    env.events().publish(
-        (Symbol::new(env, "operator_set"), caller.clone()),
-        operator.clone(),
-    );
-    Ok(())
-}
-
-pub fn require_operator(env: &Env, caller: &Address) -> Result<(), AutoTradeError> {
-    let operator = get_operator(env)?;
-    if caller != &operator {
-        return Err(AutoTradeError::Unauthorized);
-    }
-    caller.require_auth();
-    Ok(())
-}
-
-pub fn set_rate_limited(env: &Env, caller: &Address, user: &Address) -> Result<(), AutoTradeError> {
-    require_operator(env, caller)?;
-    let now = env.ledger().timestamp();
-    let expires_at = now + RATE_LIMIT_DURATION_SECONDS;
-    let info = RateLimitInfo {
-        user: user.clone(),
-        is_limited: true,
-        expires_at,
-    };
-    storage::set_rate_limit_info(env, user, &info);
-    #[allow(deprecated)]
-    env.events().publish(
-        (Symbol::new(env, "user_rate_limited"), user.clone()),
-        expires_at,
-    );
-    Ok(())
 }
 
 pub fn clear_rate_limited(
@@ -150,6 +53,42 @@ pub fn get_rate_limit_info(env: &Env, user: &Address) -> Option<RateLimitInfo> {
 
 pub fn is_rate_limited(env: &Env, user: &Address) -> bool {
     storage::is_rate_limited(env, user)
+}
+
+/// Get current operator
+pub fn get_operator(env: &Env) -> Result<Address, AutoTradeError> {
+    env.storage()
+        .instance()
+        .get(&AdminStorageKey::Operator)
+        .ok_or(AutoTradeError::Unauthorized)
+}
+
+/// Set operator (admin only)
+pub fn set_operator(env: &Env, caller: &Address, operator: Address) -> Result<(), AutoTradeError> {
+    require_admin(env, caller)?;
+    caller.require_auth();
+
+    env.storage()
+        .instance()
+        .set(&AdminStorageKey::Operator, &operator);
+
+    #[allow(deprecated)]
+    env.events().publish(
+        (Symbol::new(env, "operator_set"), caller.clone()),
+        operator.clone(),
+    );
+
+    Ok(())
+}
+
+/// Require caller is operator
+pub fn require_operator(env: &Env, caller: &Address) -> Result<(), AutoTradeError> {
+    let operator = get_operator(env)?;
+    if caller != &operator {
+        return Err(AutoTradeError::Unauthorized);
+    }
+    caller.require_auth();
+    Ok(())
 }
 
 pub fn set_guardian(env: &Env, caller: &Address, guardian: Address) -> Result<(), AutoTradeError> {
@@ -367,6 +306,7 @@ pub fn propose_admin_transfer(
     Ok(())
 }
 
+/// Accept admin transfer (called by new admin)
 pub fn accept_admin_transfer(env: &Env, caller: &Address) -> Result<(), AutoTradeError> {
     caller.require_auth();
     let pending_admin: Address = env
@@ -418,6 +358,7 @@ pub fn accept_admin_transfer(env: &Env, caller: &Address) -> Result<(), AutoTrad
     Ok(())
 }
 
+/// Cancel pending admin transfer (current admin only)
 pub fn cancel_admin_transfer(env: &Env, caller: &Address) -> Result<(), AutoTradeError> {
     require_admin(env, caller)?;
     caller.require_auth();
@@ -434,6 +375,75 @@ pub fn cancel_admin_transfer(env: &Env, caller: &Address) -> Result<(), AutoTrad
         .remove(&AdminStorageKey::PendingAdminExpiry);
     Ok(())
 }
+
+/// Set rate limit flag for a user (operator only)
+/// Sets is_limited=true and expires_at = now + RATE_LIMIT_DURATION_SECONDS
+pub fn set_rate_limited(
+    env: &Env,
+    caller: &Address,
+    user: &Address,
+) -> Result<(), AutoTradeError> {
+    require_operator(env, caller)?;
+
+    let now = env.ledger().timestamp();
+    let expires_at = now + RATE_LIMIT_DURATION_SECONDS;
+
+    let info = RateLimitInfo {
+        user: user.clone(),
+        is_limited: true,
+        expires_at,
+    };
+
+    storage::set_rate_limit_info(env, user, &info);
+
+    #[allow(deprecated)]
+    env.events().publish(
+        (Symbol::new(env, "user_rate_limited"), user.clone()),
+        expires_at,
+    );
+
+    Ok(())
+}
+
+/// Clear rate limit flag for a user (operator only)
+pub fn clear_rate_limited(
+    env: &Env,
+    caller: &Address,
+    user: &Address,
+) -> Result<(), AutoTradeError> {
+    require_operator(env, caller)?;
+
+    let info = RateLimitInfo {
+        user: user.clone(),
+        is_limited: false,
+        expires_at: 0,
+    };
+
+    storage::set_rate_limit_info(env, user, &info);
+
+    #[allow(deprecated)]
+    env.events().publish(
+        (Symbol::new(env, "user_rate_limit_cleared"), user.clone()),
+        (),
+    );
+
+    Ok(())
+}
+
+/// Get rate limit info for a user
+pub fn get_rate_limit_info(
+    env: &Env,
+    user: &Address,
+) -> Option<RateLimitInfo> {
+    storage::get_rate_limit_info(env, user)
+}
+
+/// Check if user is rate limited (and auto-expire if necessary)
+pub fn is_rate_limited(env: &Env, user: &Address) -> bool {
+    storage::is_rate_limited(env, user)
+}
+
+// ==================== Self-Destruct Protection ====================
 
 pub fn is_self_destruct_protected(env: &Env) -> bool {
     env.storage()
