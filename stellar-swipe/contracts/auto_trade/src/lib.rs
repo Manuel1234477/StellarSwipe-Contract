@@ -2151,22 +2151,22 @@ mod oracle_cb_tests {
     #[test]
     fn test_admin_override_allows_trade_when_oracle_down() {
         let (env, contract_id, admin) = setup();
+        let client = AutoTradeContractClient::new(&env, &contract_id);
 
         env.as_contract(&contract_id, || {
             admin::init_admin(&env, admin.clone());
 
-            // Trip the breaker
             let mut state = oracle::get_cb_state(&env);
             state.triggered = true;
             state.triggered_at = env.ledger().timestamp();
             env.storage()
                 .instance()
                 .set(&crate::admin::AdminStorageKey::OracleCircuitBreaker, &state);
+        });
 
-            // Admin enables override
-            oracle::override_oracle_circuit_breaker(&env, &admin, true).unwrap();
+        client.override_oracle_circuit_breaker(&admin, &true);
 
-            // check must pass despite breaker being tripped
+        env.as_contract(&contract_id, || {
             let result = oracle::check_oracle_circuit_breaker(&env, 1);
             assert!(result.is_ok(), "admin override must allow trading");
         });
@@ -2176,21 +2176,23 @@ mod oracle_cb_tests {
     #[test]
     fn test_admin_can_disable_override() {
         let (env, contract_id, admin) = setup();
+        let client = AutoTradeContractClient::new(&env, &contract_id);
 
         env.as_contract(&contract_id, || {
             admin::init_admin(&env, admin.clone());
 
-            // Trip the breaker and enable override
             let mut state = oracle::get_cb_state(&env);
             state.triggered = true;
             state.triggered_at = env.ledger().timestamp();
             env.storage()
                 .instance()
                 .set(&crate::admin::AdminStorageKey::OracleCircuitBreaker, &state);
-            oracle::override_oracle_circuit_breaker(&env, &admin, true).unwrap();
+        });
 
-            // Disable override — oracle still down → should block again
-            oracle::override_oracle_circuit_breaker(&env, &admin, false).unwrap();
+        client.override_oracle_circuit_breaker(&admin, &true);
+        client.override_oracle_circuit_breaker(&admin, &false);
+
+        env.as_contract(&contract_id, || {
             let result = oracle::check_oracle_circuit_breaker(&env, 1);
             assert_eq!(result, Err(AutoTradeError::OracleUnavailable));
         });

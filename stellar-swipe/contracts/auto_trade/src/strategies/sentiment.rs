@@ -863,15 +863,29 @@ fn sqrt(n: u32) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::AutoTradeContract;
+    use soroban_sdk::contract;
     use soroban_sdk::{
         testutils::{Address as _, Ledger as _},
         Env,
     };
 
+    #[contract]
+    struct TestContract;
+
     fn setup_env() -> Env {
         let env = Env::default();
         env.ledger().set_timestamp(1000);
+        env.mock_all_auths();
         env
+    }
+
+    fn with_contract<F, R>(env: &Env, f: F) -> R
+    where
+        F: FnOnce() -> R,
+    {
+        let cid = env.register(AutoTradeContract, ());
+        env.as_contract(&cid, f)
     }
 
     fn create_test_asset_pair(env: &Env) -> AssetPair {
@@ -896,27 +910,27 @@ mod tests {
         let asset_pair = create_test_asset_pair(&env);
         let sources = create_test_sources(&env);
 
-        env.mock_all_auths();
+        with_contract(&env, || {
+            let result = create_sentiment_strategy(
+                &env,
+                user.clone(),
+                asset_pair,
+                sources,
+                5000,
+                true,
+                2000,
+                24,
+            );
 
-        let result = create_sentiment_strategy(
-            &env,
-            user.clone(),
-            asset_pair,
-            sources,
-            5000, // 50% threshold
-            true, // require technical confirmation
-            2000, // 20% position size
-            24,   // 24 hour decay
-        );
+            assert!(result.is_ok());
+            let strategy_id = result.unwrap();
+            assert_eq!(strategy_id, 1);
 
-        assert!(result.is_ok());
-        let strategy_id = result.unwrap();
-        assert_eq!(strategy_id, 1);
-
-        let strategy = get_strategy(&env, strategy_id).unwrap();
-        assert_eq!(strategy.user, user);
-        assert_eq!(strategy.sentiment_threshold, 5000);
-        assert_eq!(strategy.position_size_pct, 2000);
+            let strategy = get_strategy(&env, strategy_id).unwrap();
+            assert_eq!(strategy.user, user);
+            assert_eq!(strategy.sentiment_threshold, 5000);
+            assert_eq!(strategy.position_size_pct, 2000);
+        });
     }
 
     #[test]
@@ -926,27 +940,26 @@ mod tests {
         let asset_pair = create_test_asset_pair(&env);
         let sources = create_test_sources(&env);
 
-        env.mock_all_auths();
+        with_contract(&env, || {
+            let result = create_sentiment_strategy(
+                &env,
+                user.clone(),
+                asset_pair.clone(),
+                sources.clone(),
+                500,
+                true,
+                2000,
+                24,
+            );
+            assert!(result.is_err());
+        });
 
-        // Too low threshold
-        let result = create_sentiment_strategy(
-            &env,
-            user.clone(),
-            asset_pair.clone(),
-            sources.clone(),
-            500, // Below minimum
-            true,
-            2000,
-            24,
-        );
-        assert!(result.is_err());
-
-        // Too high threshold
-        let result = create_sentiment_strategy(
-            &env, user, asset_pair, sources, 9500, // Above maximum
-            true, 2000, 24,
-        );
-        assert!(result.is_err());
+        with_contract(&env, || {
+            let result = create_sentiment_strategy(
+                &env, user, asset_pair, sources, 9500, true, 2000, 24,
+            );
+            assert!(result.is_err());
+        });
     }
 
     #[test]
@@ -956,19 +969,19 @@ mod tests {
         let asset_pair = create_test_asset_pair(&env);
         let sources = create_test_sources(&env);
 
-        env.mock_all_auths();
+        with_contract(&env, || {
+            let strategy_id =
+                create_sentiment_strategy(&env, user, asset_pair, sources, 5000, false, 2000, 24)
+                    .unwrap();
 
-        let strategy_id =
-            create_sentiment_strategy(&env, user, asset_pair, sources, 5000, false, 2000, 24)
-                .unwrap();
+            let sentiment = aggregate_sentiment(&env, strategy_id).unwrap();
 
-        let sentiment = aggregate_sentiment(&env, strategy_id).unwrap();
-
-        assert!(sentiment.overall_score >= -SCALE_FACTOR);
-        assert!(sentiment.overall_score <= SCALE_FACTOR);
-        assert!(sentiment.confidence > 0);
-        assert!(sentiment.confidence <= 10000);
-        assert!(sentiment.source_scores.len() > 0);
+            assert!(sentiment.overall_score >= -SCALE_FACTOR);
+            assert!(sentiment.overall_score <= SCALE_FACTOR);
+            assert!(sentiment.confidence > 0);
+            assert!(sentiment.confidence <= 10000);
+            assert!(sentiment.source_scores.len() > 0);
+        });
     }
 
     #[test]
@@ -978,23 +991,21 @@ mod tests {
         let asset_pair = create_test_asset_pair(&env);
         let sources = create_test_sources(&env);
 
-        env.mock_all_auths();
+        with_contract(&env, || {
+            let strategy_id =
+                create_sentiment_strategy(&env, user, asset_pair, sources, 5000, false, 2000, 24)
+                    .unwrap();
 
-        let strategy_id =
-            create_sentiment_strategy(&env, user, asset_pair, sources, 5000, false, 2000, 24)
-                .unwrap();
+            let mut sentiment = aggregate_sentiment(&env, strategy_id).unwrap();
+            let original_score = sentiment.overall_score;
 
-        let mut sentiment = aggregate_sentiment(&env, strategy_id).unwrap();
-        let original_score = sentiment.overall_score;
+            env.ledger().set_timestamp(1000 + 12 * 3600);
 
-        // Advance time by 12 hours
-        env.ledger().set_timestamp(1000 + 12 * 3600);
+            apply_sentiment_decay(&env, &mut sentiment, 24).unwrap();
 
-        apply_sentiment_decay(&env, &mut sentiment, 24).unwrap();
-
-        // Score should be decayed (50% after 12 hours with 24 hour decay)
-        assert!(sentiment.overall_score.abs() < original_score.abs());
-        assert_eq!(sentiment.decay_factor, 5000); // 50%
+            assert!(sentiment.overall_score.abs() < original_score.abs());
+            assert_eq!(sentiment.decay_factor, 5000);
+        });
     }
 
     #[test]
@@ -1004,22 +1015,19 @@ mod tests {
         let asset_pair = create_test_asset_pair(&env);
         let sources = create_test_sources(&env);
 
-        env.mock_all_auths();
+        with_contract(&env, || {
+            let strategy_id = create_sentiment_strategy(
+                &env, user, asset_pair, sources, 3000, false, 2000, 24,
+            )
+            .unwrap();
 
-        let strategy_id = create_sentiment_strategy(
-            &env, user, asset_pair, sources, 3000,  // Lower threshold to trigger
-            false, // No technical confirmation
-            2000, 24,
-        )
-        .unwrap();
+            let signal = check_sentiment_signal(&env, strategy_id).unwrap();
 
-        let signal = check_sentiment_signal(&env, strategy_id).unwrap();
-
-        // Should generate signal if sentiment exceeds threshold
-        if let Some(sig) = signal {
-            assert!(sig.sentiment_score.abs() >= 3000);
-            assert!(sig.confidence > 0);
-        }
+            if let Some(sig) = signal {
+                assert!(sig.sentiment_score.abs() >= 3000);
+                assert!(sig.confidence > 0);
+            }
+        });
     }
 
     #[test]
@@ -1029,33 +1037,33 @@ mod tests {
         let asset_pair = create_test_asset_pair(&env);
         let sources = create_test_sources(&env);
 
-        env.mock_all_auths();
+        with_contract(&env, || {
+            let strategy_id =
+                create_sentiment_strategy(&env, user, asset_pair, sources, 3000, false, 2000, 24)
+                    .unwrap();
 
-        let strategy_id =
-            create_sentiment_strategy(&env, user, asset_pair, sources, 3000, false, 2000, 24)
-                .unwrap();
+            let mut source_scores = Map::new(&env);
+            source_scores.set(String::from_str(&env, "test"), 7000);
 
-        let mut source_scores = Map::new(&env);
-        source_scores.set(String::from_str(&env, "test"), 7000);
+            let signal = SentimentSignal {
+                direction: TradeDirection::Buy,
+                sentiment_score: 7000,
+                confidence: 8000,
+                source_breakdown: source_scores,
+            };
 
-        let signal = SentimentSignal {
-            direction: TradeDirection::Buy,
-            sentiment_score: 7000,
-            confidence: 8000,
-            source_breakdown: source_scores,
-        };
+            let result = execute_sentiment_trade(&env, strategy_id, signal);
+            assert!(result.is_ok());
 
-        let result = execute_sentiment_trade(&env, strategy_id, signal);
-        assert!(result.is_ok());
+            let position_id = result.unwrap();
+            assert_eq!(position_id, 1);
 
-        let position_id = result.unwrap();
-        assert_eq!(position_id, 1);
+            let strategy = get_strategy(&env, strategy_id).unwrap();
+            assert_ne!(strategy.active_position.position_id, 0);
 
-        let strategy = get_strategy(&env, strategy_id).unwrap();
-        assert_ne!(strategy.active_position.position_id, 0);
-
-        let position = strategy.active_position;
-        assert_eq!(position.entry_sentiment, 7000);
+            let position = strategy.active_position;
+            assert_eq!(position.entry_sentiment, 7000);
+        });
     }
 
     #[test]
@@ -1065,28 +1073,26 @@ mod tests {
         let asset_pair = create_test_asset_pair(&env);
         let sources = create_test_sources(&env);
 
-        env.mock_all_auths();
+        with_contract(&env, || {
+            let strategy_id =
+                create_sentiment_strategy(&env, user, asset_pair, sources, 3000, false, 2000, 24)
+                    .unwrap();
 
-        let strategy_id =
-            create_sentiment_strategy(&env, user, asset_pair, sources, 3000, false, 2000, 24)
-                .unwrap();
+            let mut source_scores = Map::new(&env);
+            source_scores.set(String::from_str(&env, "test"), 7000);
 
-        // Create a position
-        let mut source_scores = Map::new(&env);
-        source_scores.set(String::from_str(&env, "test"), 7000);
+            let signal = SentimentSignal {
+                direction: TradeDirection::Buy,
+                sentiment_score: 7000,
+                confidence: 8000,
+                source_breakdown: source_scores,
+            };
 
-        let signal = SentimentSignal {
-            direction: TradeDirection::Buy,
-            sentiment_score: 7000,
-            confidence: 8000,
-            source_breakdown: source_scores,
-        };
+            execute_sentiment_trade(&env, strategy_id, signal).unwrap();
 
-        execute_sentiment_trade(&env, strategy_id, signal).unwrap();
-
-        // Check exit (would exit based on conditions)
-        let exit_result = check_sentiment_exit(&env, strategy_id);
-        assert!(exit_result.is_ok());
+            let exit_result = check_sentiment_exit(&env, strategy_id);
+            assert!(exit_result.is_ok());
+        });
     }
 
     #[test]
@@ -1096,27 +1102,26 @@ mod tests {
         let asset_pair = create_test_asset_pair(&env);
         let sources = create_test_sources(&env);
 
-        env.mock_all_auths();
+        with_contract(&env, || {
+            let strategy_id =
+                create_sentiment_strategy(&env, user, asset_pair, sources, 3000, false, 2000, 24)
+                    .unwrap();
 
-        let strategy_id =
-            create_sentiment_strategy(&env, user, asset_pair, sources, 3000, false, 2000, 24)
-                .unwrap();
+            let position = SentimentPosition {
+                position_id: 1,
+                entry_sentiment: 7000,
+                entry_price: 100_000,
+                amount: 10_000,
+                entry_time: 1000,
+            };
 
-        let position = SentimentPosition {
-            position_id: 1,
-            entry_sentiment: 7000, // Bullish
-            entry_price: 100_000,
-            amount: 10_000,
-            entry_time: 1000,
-        };
+            track_sentiment_accuracy(&env, strategy_id, &position, 110_000).unwrap();
 
-        // Exit at higher price (correct prediction)
-        track_sentiment_accuracy(&env, strategy_id, &position, 110_000).unwrap();
-
-        let accuracy = get_sentiment_accuracy(&env, strategy_id).unwrap();
-        assert_eq!(accuracy.total_signals, 1);
-        assert_eq!(accuracy.accurate_predictions, 1);
-        assert_eq!(accuracy.false_positives, 0);
+            let accuracy = get_sentiment_accuracy(&env, strategy_id).unwrap();
+            assert_eq!(accuracy.total_signals, 1);
+            assert_eq!(accuracy.accurate_predictions, 1);
+            assert_eq!(accuracy.false_positives, 0);
+        });
     }
 
     #[test]
@@ -1162,18 +1167,30 @@ mod tests {
 
     #[test]
     fn test_clamp() {
-        assert_eq!(clamp(5000, 0, 10000), 5000);
-        assert_eq!(clamp(-1000, 0, 10000), 0);
-        assert_eq!(clamp(15000, 0, 10000), 10000);
+        let env = Env::default();
+        env.ledger().set_timestamp(1000);
+        env.mock_all_auths();
+        let contract = env.register(TestContract, ());
+        env.as_contract(&contract, || {
+                    assert_eq!(clamp(5000, 0, 10000), 5000);
+                    assert_eq!(clamp(-1000, 0, 10000), 0);
+                    assert_eq!(clamp(15000, 0, 10000), 10000);
+        });
     }
 
     #[test]
     fn test_sqrt() {
-        assert_eq!(sqrt(0), 0);
-        assert_eq!(sqrt(1), 1);
-        assert_eq!(sqrt(4), 2);
-        assert_eq!(sqrt(9), 3);
-        assert_eq!(sqrt(16), 4);
-        assert_eq!(sqrt(100), 10);
+        let env = Env::default();
+        env.ledger().set_timestamp(1000);
+        env.mock_all_auths();
+        let contract = env.register(TestContract, ());
+        env.as_contract(&contract, || {
+                    assert_eq!(sqrt(0), 0);
+                    assert_eq!(sqrt(1), 1);
+                    assert_eq!(sqrt(4), 2);
+                    assert_eq!(sqrt(9), 3);
+                    assert_eq!(sqrt(16), 4);
+                    assert_eq!(sqrt(100), 10);
+        });
     }
 }

@@ -369,7 +369,7 @@ fn get_market_price(env: &Env, pair: &AssetPair) -> Result<i128, AutoTradeError>
 }
 
 fn calculate_volatility(env: &Env, pair: &AssetPair, period: u32) -> Result<u32, AutoTradeError> {
-    let history = get_price_history(env, pair, period + 1);
+    let history = get_price_history(env, pair, (period + 1).max(3));
     let vol = volatility_from_history(env, &history);
     if vol == 0 {
         Ok(1000)
@@ -454,13 +454,13 @@ mod tests {
     use crate::{AutoTradeContract, AutoTradeContractClient};
     use soroban_sdk::testutils::{Address as _, Ledger as _};
 
-    fn setup() -> (Env, AutoTradeContractClient<'static>) {
+    fn setup() -> (Env, Address, AutoTradeContractClient<'static>) {
         let env = Env::default();
         env.mock_all_auths();
         env.ledger().set_timestamp(1_000);
-        let contract = env.register(crate::AutoTradeContract, ());
+        let contract = env.register(AutoTradeContract, ());
         let client = AutoTradeContractClient::new(&env, &contract);
-        (env, client)
+        (env, contract, client)
     }
 
     fn user(env: &Env) -> Address {
@@ -469,7 +469,7 @@ mod tests {
 
     #[test]
     fn test_create_twap_order() {
-        let (env, client) = setup();
+        let (env, _contract, client) = setup();
         let trader = user(&env);
         let pair = AssetPair {
             base: String::from_str(&env, "XLM"),
@@ -491,7 +491,7 @@ mod tests {
 
     #[test]
     fn test_twap_segment_execution() {
-        let (env, client) = setup();
+        let (env, _contract, client) = setup();
         let trader = user(&env);
         let pair = AssetPair {
             base: String::from_str(&env, "XLM"),
@@ -521,7 +521,7 @@ mod tests {
 
     #[test]
     fn test_twap_cancellation() {
-        let (env, client) = setup();
+        let (env, _contract, client) = setup();
         let trader = user(&env);
         let pair = AssetPair {
             base: String::from_str(&env, "BTC"),
@@ -544,7 +544,7 @@ mod tests {
 
     #[test]
     fn test_twap_dynamic_adjustment() {
-        let (env, client) = setup();
+        let (env, contract, client) = setup();
         let trader = user(&env);
         let pair = AssetPair {
             base: String::from_str(&env, "ETH"),
@@ -555,6 +555,14 @@ mod tests {
         let initial_interval = client.get_twap_order(&order_id).interval_seconds;
         assert_eq!(initial_interval, 600);
 
+        env.as_contract(&contract, || {
+            for i in 0..15 {
+                record_price_point(&env, &pair, 100_000 + (i as i128));
+            }
+            record_price_point(&env, &pair, 100_000);
+            record_price_point(&env, &pair, 250_000);
+        });
+
         client.adjust_twap_strategy(&order_id);
 
         let adjusted_twap = client.get_twap_order(&order_id);
@@ -563,7 +571,7 @@ mod tests {
 
     #[test]
     fn test_order_completion() {
-        let (env, client) = setup();
+        let (env, _contract, client) = setup();
         let trader = user(&env);
         let pair = AssetPair {
             base: String::from_str(&env, "SOL"),

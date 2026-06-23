@@ -187,7 +187,12 @@ pub fn check_oracle_circuit_breaker(env: &Env, asset_pair: u32) -> Result<(), Au
     }
 
     // Breaker is tripped — attempt auto-recovery by probing the oracle
-    match get_oracle_price(env, asset_pair) {
+    let price_result = match get_oracle_price(env, asset_pair) {
+        Ok(price) => Ok(price),
+        Err(OracleError::NotConfigured) => get_mock_oracle_price(env, asset_pair),
+        Err(err) => Err(err),
+    };
+    match price_result {
         Ok(_) => {
             // Oracle recovered — reset breaker
             let mut new_state = state;

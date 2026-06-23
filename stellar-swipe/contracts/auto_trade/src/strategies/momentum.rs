@@ -606,8 +606,21 @@ pub fn get_historical_prices(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::AutoTradeContract;
+    use soroban_sdk::contract;
     use soroban_sdk::testutils::{Address as _, Ledger};
     use soroban_sdk::Env;
+
+    #[contract]
+    struct TestContract;
+
+    fn with_contract<F, R>(env: &Env, f: F) -> R
+    where
+        F: FnOnce() -> R,
+    {
+        let cid = env.register(AutoTradeContract, ());
+        env.as_contract(&cid, f)
+    }
 
     fn setup_test_prices(env: &Env) -> Vec<i128> {
         let mut prices = Vec::new(env);
@@ -632,6 +645,12 @@ mod tests {
         prices.push_back(140); // +1.4%
         prices.push_back(142); // +1.4%
         prices.push_back(145); // +2.1%
+        prices.push_back(147); // +1.4%
+        prices.push_back(149); // +1.4%
+        prices.push_back(151); // +1.3%
+        prices.push_back(153); // +1.3%
+        prices.push_back(155); // +1.3%
+        prices.push_back(157); // +1.3%
         prices
     }
 
@@ -658,6 +677,12 @@ mod tests {
         prices.push_back(60); // -3.2%
         prices.push_back(58); // -3.3%
         prices.push_back(55); // -5.2%
+        prices.push_back(53); // -3.6%
+        prices.push_back(51); // -3.8%
+        prices.push_back(49); // -3.9%
+        prices.push_back(47); // -4.1%
+        prices.push_back(45); // -4.3%
+        prices.push_back(43); // -4.4%
         prices
     }
 
@@ -667,8 +692,7 @@ mod tests {
         let prices = setup_test_prices(&env);
 
         let roc = calculate_rate_of_change(&prices, 1).unwrap();
-        // (145 - 100) / 100 * 10000 = 45 * 100 = 4500 (45%)
-        assert!(roc > 4000 && roc < 5000); // Should be around 4500
+        assert!(roc > 5500 && roc < 6000);
     }
 
     #[test]
@@ -677,8 +701,7 @@ mod tests {
         let prices = setup_test_prices_downtrend(&env);
 
         let roc = calculate_rate_of_change(&prices, 1).unwrap();
-        // (55 - 100) / 100 * 10000 = -45 * 100 = -4500 (-45%)
-        assert!(roc < -4000 && roc > -5000); // Should be around -4500
+        assert!(roc < -5500 && roc > -6000);
     }
 
     #[test]
@@ -801,46 +824,47 @@ mod tests {
         let env = Env::default();
         env.ledger().set_timestamp(1000);
 
-        let user = Address::generate(&env);
-        let asset_pair = AssetPair { base: 1, quote: 2 };
+        with_contract(&env, || {
+            let user = Address::generate(&env);
+            let asset_pair = AssetPair { base: 1, quote: 2 };
 
-        let strategy = MomentumStrategy {
-            strategy_id: 1,
-            user: user.clone(),
-            asset_pairs: Vec::new(&env),
-            momentum_period_days: 7,
-            min_momentum_threshold: 1000,
-            trend_confirmation_required: false,
-            position_size_pct: 1000, // 10% of portfolio
-            trailing_stop_pct: 1000, // 10% below highest
-            ranking_enabled: false,
-        };
+            let strategy = MomentumStrategy {
+                strategy_id: 1,
+                user: user.clone(),
+                asset_pairs: Vec::new(&env),
+                momentum_period_days: 7,
+                min_momentum_threshold: 1000,
+                trend_confirmation_required: false,
+                position_size_pct: 1000,
+                trailing_stop_pct: 1000,
+                ranking_enabled: false,
+            };
 
-        store_momentum_strategy(&env, &strategy);
+            store_momentum_strategy(&env, &strategy);
 
-        let signal = MomentumSignal {
-            asset_pair,
-            direction: TradeDirection::Buy,
-            momentum_strength: 2000,
-            rsi: 7000,
-            trend_strength: 7000,
-            confidence: 8000,
-        };
+            let signal = MomentumSignal {
+                asset_pair,
+                direction: TradeDirection::Buy,
+                momentum_strength: 2000,
+                rsi: 7000,
+                trend_strength: 7000,
+                confidence: 8000,
+            };
 
-        let current_price = 1000;
-        let portfolio_value = 10000;
+            let current_price = 1000;
+            let portfolio_value = 10000;
 
-        let trade_id =
-            execute_momentum_trade(&env, 1, signal, current_price, portfolio_value).unwrap();
+            let _trade_id =
+                execute_momentum_trade(&env, 1, signal, current_price, portfolio_value).unwrap();
 
-        // Verify position was created
-        let positions = get_strategy_positions(&env, 1);
-        assert!(positions.contains_key(asset_pair.base));
+            let positions = get_strategy_positions(&env, 1);
+            assert!(positions.contains_key(asset_pair.base));
 
-        let position = positions.get(asset_pair.base).unwrap();
-        assert_eq!(position.asset_pair, asset_pair);
-        assert_eq!(position.entry_price, current_price);
-        assert_eq!(position.amount, 1000); // 10% of 10000
+            let position = positions.get(asset_pair.base).unwrap();
+            assert_eq!(position.asset_pair, asset_pair);
+            assert_eq!(position.entry_price, current_price);
+            assert_eq!(position.amount, 1000);
+        });
     }
 
     #[test]
@@ -848,37 +872,38 @@ mod tests {
         let env = Env::default();
         env.ledger().set_timestamp(1000);
 
-        let user = Address::generate(&env);
-        let asset_pair = AssetPair { base: 1, quote: 2 };
+        with_contract(&env, || {
+            let user = Address::generate(&env);
+            let asset_pair = AssetPair { base: 1, quote: 2 };
 
-        let strategy = MomentumStrategy {
-            strategy_id: 1,
-            user,
-            asset_pairs: Vec::new(&env),
-            momentum_period_days: 7,
-            min_momentum_threshold: 1000,
-            trend_confirmation_required: false,
-            position_size_pct: 1000,
-            trailing_stop_pct: 1000, // 10% trailing stop
-            ranking_enabled: false,
-        };
+            let strategy = MomentumStrategy {
+                strategy_id: 1,
+                user,
+                asset_pairs: Vec::new(&env),
+                momentum_period_days: 7,
+                min_momentum_threshold: 1000,
+                trend_confirmation_required: false,
+                position_size_pct: 1000,
+                trailing_stop_pct: 1000,
+                ranking_enabled: false,
+            };
 
-        store_momentum_strategy(&env, &strategy);
+            store_momentum_strategy(&env, &strategy);
 
-        // Create initial position
-        let signal = MomentumSignal {
-            asset_pair,
-            direction: TradeDirection::Buy,
-            momentum_strength: 2000,
-            rsi: 7000,
-            trend_strength: 7000,
-            confidence: 8000,
-        };
+            let signal = MomentumSignal {
+                asset_pair,
+                direction: TradeDirection::Buy,
+                momentum_strength: 2000,
+                rsi: 7000,
+                trend_strength: 7000,
+                confidence: 8000,
+            };
 
-        execute_momentum_trade(&env, 1, signal, 1000, 10000).unwrap();
+            execute_momentum_trade(&env, 1, signal, 1000, 10000).unwrap();
 
-        let closed = update_trailing_stops(&env, 1).unwrap();
-        assert_eq!(closed.len(), 0); // No positions closed if price doesn't move
+            let closed = update_trailing_stops(&env, 1).unwrap();
+            assert_eq!(closed.len(), 0);
+        });
     }
 
     #[test]
@@ -929,35 +954,36 @@ mod tests {
         let env = Env::default();
         env.ledger().set_timestamp(1000);
 
-        let user = Address::generate(&env);
-        let pair1 = AssetPair { base: 1, quote: 2 };
-        let pair2 = AssetPair { base: 3, quote: 4 };
+        with_contract(&env, || {
+            let user = Address::generate(&env);
+            let pair1 = AssetPair { base: 1, quote: 2 };
+            let pair2 = AssetPair { base: 3, quote: 4 };
 
-        let mut asset_pairs = Vec::new(&env);
-        asset_pairs.push_back(pair1);
-        asset_pairs.push_back(pair2);
+            let mut asset_pairs = Vec::new(&env);
+            asset_pairs.push_back(pair1);
+            asset_pairs.push_back(pair2);
 
-        let strategy = MomentumStrategy {
-            strategy_id: 1,
-            user,
-            asset_pairs,
-            momentum_period_days: 7,
-            min_momentum_threshold: 1000,
-            trend_confirmation_required: false,
-            position_size_pct: 1000,
-            trailing_stop_pct: 1000,
-            ranking_enabled: true,
-        };
+            let strategy = MomentumStrategy {
+                strategy_id: 1,
+                user,
+                asset_pairs,
+                momentum_period_days: 7,
+                min_momentum_threshold: 1000,
+                trend_confirmation_required: false,
+                position_size_pct: 1000,
+                trailing_stop_pct: 1000,
+                ranking_enabled: true,
+            };
 
-        store_momentum_strategy(&env, &strategy);
+            store_momentum_strategy(&env, &strategy);
 
-        // Create ranked list
-        let mut ranked = Vec::new(&env);
-        ranked.push_back((pair1, 5000));
-        ranked.push_back((pair2, 2000));
+            let mut ranked = Vec::new(&env);
+            ranked.push_back((pair1, 5000));
+            ranked.push_back((pair2, 2000));
 
-        let result = rebalance_by_momentum_rank(&env, 1, &ranked, 1);
-        assert!(result.is_ok());
+            let result = rebalance_by_momentum_rank(&env, 1, &ranked, 1);
+            assert!(result.is_ok());
+        });
     }
 
     #[test]

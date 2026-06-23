@@ -297,11 +297,11 @@ pub fn enforce_correlation_limits(
     let limits = get_correlation_limits(env, user);
     let risk = check_portfolio_correlation(env, user, new_asset, new_amount)?;
 
-    if risk.correlated_exposure_pct > limits.max_correlated_exposure_pct as i128 {
-        return Err(AutoTradeError::CorrelationLimitExceeded);
-    }
     if risk.highly_correlated_assets > limits.max_correlated_positions {
         return Err(AutoTradeError::TooManyCorrelatedPositions);
+    }
+    if risk.correlated_exposure_pct > limits.max_correlated_exposure_pct as i128 {
+        return Err(AutoTradeError::CorrelationLimitExceeded);
     }
 
     Ok(())
@@ -460,9 +460,9 @@ mod tests {
     fn test_negative_correlation() {
         let (env, addr) = setup();
         env.as_contract(&addr, || {
-            // Perfectly inverse series.
-            let a = [100i128, 102, 104, 106, 108];
-            let b = [108i128, 106, 104, 102, 100];
+            // Opposite return directions → negative correlation.
+            let a = [100i128, 110, 100, 110, 100, 110, 100, 110];
+            let b = [100i128, 90, 100, 90, 100, 90, 100, 90];
             seed_prices(&env, 1, &a);
             seed_prices(&env, 2, &b);
             let corr = calculate_correlation(&env, 1, 2, 30);

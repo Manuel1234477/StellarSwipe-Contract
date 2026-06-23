@@ -193,12 +193,12 @@ pub fn calculate_statistical_metrics(
     let sum: i128 = (0..prices.len()).map(|i| prices.get(i).unwrap()).sum();
     let mean = sum / n;
 
-    let variance: i128 = (0..prices.len())
-        .map(|i| {
-            let diff = prices.get(i).unwrap() - mean;
-            (diff * diff) / n
-        })
-        .sum();
+    let mut sum_sq = 0i128;
+    for i in 0..prices.len() {
+        let diff = prices.get(i).unwrap() - mean;
+        sum_sq += diff * diff;
+    }
+    let variance = sum_sq / n;
     let std_dev = isqrt(variance);
 
     // Require minimum volatility to avoid division by near-zero

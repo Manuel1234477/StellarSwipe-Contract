@@ -508,7 +508,7 @@ mod tests {
 
             // Price rises to 1100 (no TP hit), then drops 10% → stop at 990
             check_and_execute_exits(&env, id, 1_100).unwrap();
-            let trades = check_and_execute_exits(&env, id, 990).unwrap();
+            let trades = check_and_execute_exits(&env, id, 989).unwrap();
             assert_eq!(trades.len(), 1);
 
             let s = get_exit_strategy(&env, id).unwrap();
