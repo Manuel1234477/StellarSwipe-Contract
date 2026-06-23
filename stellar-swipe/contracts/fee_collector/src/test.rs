@@ -520,6 +520,7 @@ fn test_collect_fee_requires_configured_oracle() {
     client.initialize(&admin);
 
     StellarAssetClient::new(&env, &token).mint(&trader, &(1_000 * 10_000_000));
+    mark_trader_has_traded(&env, &contract_id, &trader);
     let result = client.try_collect_fee(&trader, &token, &(1_000 * 10_000_000), &trade_asset(&env));
 
     assert_eq!(result, Err(Ok(ContractError::OracleNotConfigured)));
