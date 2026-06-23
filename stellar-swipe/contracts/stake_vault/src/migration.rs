@@ -425,6 +425,17 @@ mod tests {
         env
     }
 
+    /// Each migration call needs its own contract frame so `require_auth()` is not
+    /// invoked twice on the same authorized frame.
+    fn run_migrate(
+        env: &Env,
+        contract_addr: &Address,
+        admin: &Address,
+        batch_size: u32,
+    ) -> Result<MigrationBatchResult, MigrationError> {
+        env.as_contract(contract_addr, || migrate_stakes_v1_to_v2(env, admin, batch_size))
+    }
+
     /// Seed 50 providers into V1 and migrate them in two batches.
     /// Verifies every balance is preserved exactly and batch_number increments.
     #[test]
@@ -432,40 +443,39 @@ mod tests {
         let env = setup();
         let contract_addr = env.register(TestContract, ());
 
-        env.as_contract(&contract_addr, || {
-            let admin = Address::generate(&env);
-            let mut v1: Map<Address, i128> = Map::new(&env);
+        let admin = Address::generate(&env);
+        let mut v1: Map<Address, i128> = Map::new(&env);
 
-            let mut providers = Vec::new(&env);
-            for i in 0..50u32 {
-                let p = Address::generate(&env);
-                let balance = (i as i128 + 1) * 1_000_000;
-                v1.set(p.clone(), balance);
-                providers.push_back(p);
-            }
-            seed_v1_stakes(&env, v1.clone());
+        let mut providers = Vec::new(&env);
+        for i in 0..50u32 {
+            let p = Address::generate(&env);
+            let balance = (i as i128 + 1) * 1_000_000;
+            v1.set(p.clone(), balance);
+            providers.push_back(p);
+        }
+        env.as_contract(&contract_addr, || seed_v1_stakes(&env, v1.clone()));
 
-            // Batch 1: migrate 30
-            let r1 = migrate_stakes_v1_to_v2(&env, &admin, 30).unwrap();
-            assert_eq!(r1.migrated_this_batch, 30);
-            assert_eq!(r1.batch_number, 1);
-            assert_eq!(r1.pending_recovery_count, 0);
-            assert!(!r1.complete);
+        // Batch 1: migrate 30
+        let r1 = run_migrate(&env, &contract_addr, &admin, 30).unwrap();
+        assert_eq!(r1.migrated_this_batch, 30);
+        assert_eq!(r1.batch_number, 1);
+        assert_eq!(r1.pending_recovery_count, 0);
+        assert!(!r1.complete);
 
-            // Batch 2: migrate remaining 20
-            let r2 = migrate_stakes_v1_to_v2(&env, &admin, 30).unwrap();
-            assert_eq!(r2.migrated_this_batch, 20);
-            assert_eq!(r2.batch_number, 2);
-            assert!(r2.complete);
-            assert_eq!(r2.total_migrated, 50);
+        // Batch 2: migrate remaining 20
+        let r2 = run_migrate(&env, &contract_addr, &admin, 30).unwrap();
+        assert_eq!(r2.migrated_this_batch, 20);
+        assert_eq!(r2.batch_number, 2);
+        assert!(r2.complete);
+        assert_eq!(r2.total_migrated, 50);
 
-            // Verify every balance
-            for i in 0..50u32 {
-                let p = providers.get(i).unwrap();
-                let expected = (i as i128 + 1) * 1_000_000;
-                assert_eq!(get_v2_balance(&env, &p), Some(expected));
-            }
-        });
+        // Verify every balance
+        for i in 0..50u32 {
+            let p = providers.get(i).unwrap();
+            let expected = (i as i128 + 1) * 1_000_000;
+            let balance = env.as_contract(&contract_addr, || get_v2_balance(&env, &p));
+            assert_eq!(balance, Some(expected));
+        }
     }
 
     #[test]
@@ -473,18 +483,16 @@ mod tests {
         let env = setup();
         let contract_addr = env.register(TestContract, ());
 
-        env.as_contract(&contract_addr, || {
-            let admin = Address::generate(&env);
-            let mut v1: Map<Address, i128> = Map::new(&env);
-            let p = Address::generate(&env);
-            v1.set(p.clone(), 500_000_000);
-            seed_v1_stakes(&env, v1);
+        let admin = Address::generate(&env);
+        let mut v1: Map<Address, i128> = Map::new(&env);
+        let p = Address::generate(&env);
+        v1.set(p.clone(), 500_000_000);
+        env.as_contract(&contract_addr, || seed_v1_stakes(&env, v1));
 
-            migrate_stakes_v1_to_v2(&env, &admin, 10).unwrap();
+        run_migrate(&env, &contract_addr, &admin, 10).unwrap();
 
-            // Second call should return AlreadyComplete
-            let err = migrate_stakes_v1_to_v2(&env, &admin, 10).unwrap_err();
-            assert_eq!(err, MigrationError::AlreadyComplete);
-        });
+        // Second call should return AlreadyComplete
+        let err = run_migrate(&env, &contract_addr, &admin, 10).unwrap_err();
+        assert_eq!(err, MigrationError::AlreadyComplete);
     }
 }

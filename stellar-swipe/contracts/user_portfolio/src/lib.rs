@@ -826,7 +826,19 @@ mod streak_tests {
 
         // Now close with a loss
         let id = client.open_position(&user, &100, &1_000);
-        client.close_position(&user, &id, &0, &80, &1u32, &provider, &1u64);
+        client.close_position(&user, &id, &-50, &80, &1u32, &provider, &1u64);
+
+        // Check events before any other contract frame (env.events().all() is per-frame).
+        let has_broken = env.events().all().iter().any(|e| {
+            let topics: soroban_sdk::Vec<soroban_sdk::Val> = e.1.clone();
+            if topics.len() < 2 {
+                return false;
+            }
+            soroban_sdk::Symbol::try_from_val(&env, &topics.get(1).unwrap())
+                .map(|s| s == soroban_sdk::Symbol::new(&env, "streak_broken"))
+                .unwrap_or(false)
+        });
+        assert!(has_broken, "streak_broken event not emitted");
 
         // current should be 0, best should be 2
         let current: u32 = env.as_contract(&contract_id, || {
@@ -844,18 +856,6 @@ mod streak_tests {
 
         assert_eq!(current, 0);
         assert_eq!(best, 2);
-
-        // Check that a StreakBroken event was emitted
-        let has_broken = env.events().all().iter().any(|e| {
-            let topics: soroban_sdk::Vec<soroban_sdk::Val> = e.1.clone();
-            if topics.len() < 2 {
-                return false;
-            }
-            soroban_sdk::Symbol::try_from_val(&env, &topics.get(1).unwrap())
-                .map(|s| s == soroban_sdk::Symbol::new(&env, "streak_broken"))
-                .unwrap_or(false)
-        });
-        assert!(has_broken, "streak_broken event not emitted");
     }
 }
 

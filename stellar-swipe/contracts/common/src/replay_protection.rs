@@ -111,14 +111,29 @@ fn emit_replay(env: &Env, user: &Address, tx_hash: &Bytes, reason: soroban_sdk::
 mod tests {
     use super::*;
     use soroban_sdk::{
+        contract, contractimpl,
         testutils::{Address as _, Ledger},
-        Bytes, Env,
+        Address, Bytes, Env,
     };
 
-    fn env_user() -> (Env, Address) {
+    #[contract]
+    struct ReplayHarness;
+
+    #[contractimpl]
+    impl ReplayHarness {}
+
+    fn setup() -> (Env, Address, Address) {
         let env = Env::default();
+        let contract_id = env.register(ReplayHarness, ());
         let user = Address::generate(&env);
-        (env, user)
+        (env, contract_id, user)
+    }
+
+    fn run<F, R>(env: &Env, contract_id: &Address, f: F) -> R
+    where
+        F: FnOnce() -> R,
+    {
+        env.as_contract(contract_id, f)
     }
 
     fn hash(env: &Env, seed: u8) -> Bytes {
@@ -133,90 +148,104 @@ mod tests {
 
     #[test]
     fn sequential_nonces_succeed() {
-        let (env, user) = env_user();
-        for i in 1u64..=5 {
-            assert_eq!(
-                verify_and_commit(&env, &user, i, hash(&env, i as u8), far_future(&env)),
-                Ok(())
-            );
-        }
-        assert_eq!(current_nonce(&env, &user), 5);
+        let (env, contract_id, user) = setup();
+        run(&env, &contract_id, || {
+            for i in 1u64..=5 {
+                assert_eq!(
+                    verify_and_commit(&env, &user, i, hash(&env, i as u8), far_future(&env)),
+                    Ok(())
+                );
+            }
+            assert_eq!(current_nonce(&env, &user), 5);
+        });
     }
 
     // ── Replay via hash ───────────────────────────────────────────────────────
 
     #[test]
     fn duplicate_tx_rejected() {
-        let (env, user) = env_user();
-        let h = hash(&env, 1);
-        verify_and_commit(&env, &user, 1, h.clone(), far_future(&env)).unwrap();
-        // Resubmit same hash with next nonce — still rejected as duplicate
-        let err = verify_and_commit(&env, &user, 2, h, far_future(&env));
-        assert_eq!(err, Err(ReplayError::DuplicateTx));
+        let (env, contract_id, user) = setup();
+        run(&env, &contract_id, || {
+            let h = hash(&env, 1);
+            verify_and_commit(&env, &user, 1, h.clone(), far_future(&env)).unwrap();
+            // Resubmit same hash with next nonce — still rejected as duplicate
+            let err = verify_and_commit(&env, &user, 2, h, far_future(&env));
+            assert_eq!(err, Err(ReplayError::DuplicateTx));
+        });
     }
 
     // ── Nonce gap ─────────────────────────────────────────────────────────────
 
     #[test]
     fn skipped_nonce_rejected() {
-        let (env, user) = env_user();
-        verify_and_commit(&env, &user, 1, hash(&env, 1), far_future(&env)).unwrap();
-        // Jump to nonce 3 — should fail
-        let err = verify_and_commit(&env, &user, 3, hash(&env, 3), far_future(&env));
-        assert_eq!(err, Err(ReplayError::InvalidNonce));
+        let (env, contract_id, user) = setup();
+        run(&env, &contract_id, || {
+            verify_and_commit(&env, &user, 1, hash(&env, 1), far_future(&env)).unwrap();
+            // Jump to nonce 3 — should fail
+            let err = verify_and_commit(&env, &user, 3, hash(&env, 3), far_future(&env));
+            assert_eq!(err, Err(ReplayError::InvalidNonce));
+        });
     }
 
     #[test]
     fn repeated_nonce_rejected() {
-        let (env, user) = env_user();
-        verify_and_commit(&env, &user, 1, hash(&env, 1), far_future(&env)).unwrap();
-        let err = verify_and_commit(&env, &user, 1, hash(&env, 2), far_future(&env));
-        assert_eq!(err, Err(ReplayError::InvalidNonce));
+        let (env, contract_id, user) = setup();
+        run(&env, &contract_id, || {
+            verify_and_commit(&env, &user, 1, hash(&env, 1), far_future(&env)).unwrap();
+            let err = verify_and_commit(&env, &user, 1, hash(&env, 2), far_future(&env));
+            assert_eq!(err, Err(ReplayError::InvalidNonce));
+        });
     }
 
     // ── Expiry ────────────────────────────────────────────────────────────────
 
     #[test]
     fn expired_tx_rejected() {
-        let (env, user) = env_user();
-        let past = env.ledger().timestamp().saturating_sub(1);
-        let err = verify_and_commit(&env, &user, 1, hash(&env, 1), past);
-        assert_eq!(err, Err(ReplayError::Expired));
+        let (env, contract_id, user) = setup();
+        run(&env, &contract_id, || {
+            env.ledger().set_timestamp(1_000);
+            let err = verify_and_commit(&env, &user, 1, hash(&env, 1), 999);
+            assert_eq!(err, Err(ReplayError::Expired));
+        });
     }
 
     // ── Hash TTL expiry allows reuse ──────────────────────────────────────────
 
     #[test]
     fn hash_reusable_after_ttl() {
-        let (env, user) = env_user();
-        let h = hash(&env, 42);
-        verify_and_commit(&env, &user, 1, h.clone(), far_future(&env)).unwrap();
+        let (env, contract_id, user) = setup();
+        run(&env, &contract_id, || {
+            let h = hash(&env, 42);
+            verify_and_commit(&env, &user, 1, h.clone(), far_future(&env)).unwrap();
 
-        // Advance past 1-hour TTL
-        env.ledger()
-            .set_timestamp(env.ledger().timestamp() + TX_HASH_TTL_SECS + 1);
+            // Advance past 1-hour TTL
+            env.ledger()
+                .set_timestamp(env.ledger().timestamp() + TX_HASH_TTL_SECS + 1);
 
-        // Same hash is now allowed (TTL expired); nonce must be 2
-        assert_eq!(
-            verify_and_commit(&env, &user, 2, h, far_future(&env)),
-            Ok(())
-        );
+            // Same hash is now allowed (TTL expired); nonce must be 2
+            assert_eq!(
+                verify_and_commit(&env, &user, 2, h, far_future(&env)),
+                Ok(())
+            );
+        });
     }
 
     // ── Independent users ─────────────────────────────────────────────────────
 
     #[test]
     fn users_have_independent_nonces() {
-        let (env, user1) = env_user();
-        let user2 = Address::generate(&env);
+        let (env, contract_id, user1) = setup();
+        run(&env, &contract_id, || {
+            let user2 = Address::generate(&env);
 
-        verify_and_commit(&env, &user1, 1, hash(&env, 1), far_future(&env)).unwrap();
-        verify_and_commit(&env, &user1, 2, hash(&env, 2), far_future(&env)).unwrap();
+            verify_and_commit(&env, &user1, 1, hash(&env, 1), far_future(&env)).unwrap();
+            verify_and_commit(&env, &user1, 2, hash(&env, 2), far_future(&env)).unwrap();
 
-        // user2 starts at nonce 1 regardless of user1
-        assert_eq!(
-            verify_and_commit(&env, &user2, 1, hash(&env, 3), far_future(&env)),
-            Ok(())
-        );
+            // user2 starts at nonce 1 regardless of user1
+            assert_eq!(
+                verify_and_commit(&env, &user2, 1, hash(&env, 3), far_future(&env)),
+                Ok(())
+            );
+        });
     }
 }
