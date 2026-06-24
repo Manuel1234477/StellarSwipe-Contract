@@ -176,7 +176,7 @@ pub fn send_cross_contract_message(
 
     save_message(env, &message);
     publish_message_event(env, Symbol::new(env, "msg_sent"), &message);
-    Ok(next_depth)
+    Ok(id)
 }
 
 pub fn acknowledge_message_delivery(
