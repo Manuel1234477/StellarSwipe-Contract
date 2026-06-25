@@ -105,7 +105,7 @@ pub fn get_price_with_slippage(env: &Env, pair: AssetPair, amount: i128) -> (i12
 fn build_liquidity_graph(env: &Env) -> Vec<AssetPair> {
     let pairs_map = storage::get_available_pairs(env);
     let mut pairs = Vec::new(env);
-    for (pair, _) in pairs_map.iter() {
+    for pair in pairs_map.iter() {
         pairs.push_back(pair);
     }
     pairs
@@ -331,26 +331,13 @@ mod tests {
 
         let graph = soroban_sdk::vec![
             &env,
-            AssetPair {
-                base: a.clone(),
-                quote: b.clone(),
-            },
-            AssetPair {
-                base: b.clone(),
-                quote: c.clone(),
-            },
-            AssetPair {
-                base: c.clone(),
-                quote: d.clone(),
-            },
-            AssetPair {
-                base: a.clone(),
-                quote: d.clone(),
-            },
+            AssetPair { base: a.clone(), quote: b.clone() },
+            AssetPair { base: b.clone(), quote: c.clone() },
+            AssetPair { base: c.clone(), quote: d.clone() },
+            AssetPair { base: a.clone(), quote: d.clone() },
         ];
-
         let paths = find_all_paths(&env, &graph, &a, &d, 3);
-        assert_eq!(paths.len(), 2); // A->D and A->B->C->D
+        assert_eq!(paths.len(), 2);
     }
 
     #[test]

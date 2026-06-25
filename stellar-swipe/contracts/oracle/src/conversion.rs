@@ -123,7 +123,7 @@ fn find_conversion_path(
 fn get_available_pairs(env: &Env) -> Vec<AssetPair> {
     let pairs_map = crate::storage::get_available_pairs(env);
     let mut pairs = vec![env];
-    for (pair, _) in pairs_map.iter() {
+    for pair in pairs_map.iter() {
         pairs.push_back(pair);
     }
     pairs

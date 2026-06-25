@@ -64,9 +64,9 @@ pub fn calculate_twap(
     Ok(sum / count as i128)
 }
 
-/// Prune data older than 7 days (circular buffer)
+/// Prune the single bucket that just fell outside the 7-day window
 fn prune_old_data(env: &Env, pair: &AssetPair, current_bucket: u64) {
-    if current_bucket <= MAX_BUCKETS {
+    if current_bucket < MAX_BUCKETS {
         return;
     }
 
