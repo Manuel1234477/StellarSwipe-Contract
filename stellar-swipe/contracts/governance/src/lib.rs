@@ -9,6 +9,7 @@ mod proposal_deposit;
 mod proposals;
 mod quadratic_voting;
 mod reputation;
+mod shadow_mode;
 mod timelock;
 mod token;
 mod treasury;
@@ -22,6 +23,9 @@ mod test_committee_elections;
 mod test_health;
 #[cfg(test)]
 mod test_pause_propagation;
+#[cfg(test)]
+#[allow(non_snake_case)]
+mod test_portableDD;
 
 use committees::{
     list_committees as list_registered_committees, CommitteeAction, CommitteeElection,
@@ -69,6 +73,7 @@ use reputation::{
     record_proposal_outcome, record_vote, refresh_stale_reputation, resolve_staleness, Badge,
     GovernanceReputation, ReputationConfig, ReputationTier, StalenessLevel,
 };
+pub use shadow_mode::ShadowModeState;
 use soroban_sdk::{
     contract, contractimpl, contracttype, symbol_short, Address, Bytes, Env, Map, String, Symbol,
     Vec,
@@ -130,6 +135,8 @@ pub enum StorageKey {
     DepositConfig,
     /// Address of the treasury wallet for forfeited deposits.
     TreasuryAddress,
+    /// Shadow-mode canary upgrade trial state (issue #589).
+    ShadowMode,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -906,6 +913,51 @@ impl GovernanceContract {
         Ok(amount)
     }
 
+    // ── Shadow-mode canary upgrade (#589) ─────────────────────────────────────
+
+    /// Admin-only: begin a shadow-mode trial for a new WASM upgrade.
+    ///
+    /// During `trial_duration_seconds` read-only paths may call
+    /// `shadow_compare` to detect divergence between old and new logic.
+    pub fn enter_shadow_mode(
+        env: Env,
+        admin: Address,
+        new_wasm_hash: Bytes,
+        trial_duration_seconds: u64,
+    ) -> Result<ShadowModeState, GovernanceError> {
+        require_initialized(&env)?;
+        shadow_mode::enter_shadow_mode(&env, &admin, new_wasm_hash, trial_duration_seconds)
+    }
+
+    /// Compare two output hashes for a read-only entrypoint during shadow mode.
+    ///
+    /// Emits a `shadow/discrep` event when they differ. Returns `true` on match.
+    pub fn shadow_compare(
+        env: Env,
+        entrypoint_id: u32,
+        old_output_hash: Bytes,
+        new_output_hash: Bytes,
+    ) -> bool {
+        shadow_mode::compare_shadow_results(&env, entrypoint_id, old_output_hash, new_output_hash)
+    }
+
+    /// Return whether the contract is currently in an active shadow-mode trial.
+    pub fn is_in_shadow_mode(env: Env) -> bool {
+        shadow_mode::is_in_shadow_mode(&env)
+    }
+
+    /// Admin-only: promote the new logic and end the shadow trial.
+    pub fn promote_from_shadow_mode(env: Env, admin: Address) -> Result<(), GovernanceError> {
+        require_initialized(&env)?;
+        shadow_mode::promote_from_shadow_mode(&env, &admin)
+    }
+
+    /// Admin-only: cancel the shadow trial without promoting.
+    pub fn cancel_shadow_mode(env: Env, admin: Address) -> Result<(), GovernanceError> {
+        require_initialized(&env)?;
+        shadow_mode::cancel_shadow_mode(&env, &admin)
+    }
+
     pub fn stake(env: Env, user: Address, amount: i128) -> Result<(), GovernanceError> {
         require_initialized(&env)?;
         require_not_paused(&env)?;
@@ -1675,28 +1727,35 @@ pub(crate) fn subtract_staked_balance(
 }
 
 pub(crate) fn get_pending_rewards(env: &Env) -> Map<Address, i128> {
+    // Migrated to persistent storage (#592): per-user data should not occupy
+    // the size-limited instance storage slot. Fall back to instance for any
+    // data written before this migration.
     env.storage()
-        .instance()
+        .persistent()
         .get(&StorageKey::PendingRewards)
+        .or_else(|| env.storage().instance().get(&StorageKey::PendingRewards))
         .unwrap_or(Map::new(env))
 }
 
 pub(crate) fn put_pending_rewards(env: &Env, rewards: &Map<Address, i128>) {
     env.storage()
-        .instance()
+        .persistent()
         .set(&StorageKey::PendingRewards, rewards);
 }
 
 pub(crate) fn get_vesting_schedules(env: &Env) -> Map<Address, VestingSchedule> {
+    // Migrated to persistent storage (#592): vesting schedules are long-lived
+    // per-user data that should not occupy instance storage.
     env.storage()
-        .instance()
+        .persistent()
         .get(&StorageKey::VestingSchedules)
+        .or_else(|| env.storage().instance().get(&StorageKey::VestingSchedules))
         .unwrap_or(Map::new(env))
 }
 
 pub(crate) fn put_vesting_schedules(env: &Env, schedules: &Map<Address, VestingSchedule>) {
     env.storage()
-        .instance()
+        .persistent()
         .set(&StorageKey::VestingSchedules, schedules);
 }
 
@@ -1714,9 +1773,12 @@ pub(crate) fn put_distribution_state(env: &Env, state: &DistributionState) {
 }
 
 pub(crate) fn get_vote_locks(env: &Env) -> Map<Address, u32> {
+    // Migrated to persistent storage (#592): vote-lock data is per-user and
+    // should not compete for the shared instance storage budget.
     env.storage()
-        .instance()
+        .persistent()
         .get(&StorageKey::VoteLocks)
+        .or_else(|| env.storage().instance().get(&StorageKey::VoteLocks))
         .unwrap_or(Map::new(env))
 }
 
@@ -1747,7 +1809,9 @@ pub(crate) fn put_committees_state(env: &Env, committees_state: &CommitteesState
 }
 
 pub(crate) fn put_vote_locks(env: &Env, locks: &Map<Address, u32>) {
-    env.storage().instance().set(&StorageKey::VoteLocks, locks);
+    env.storage()
+        .persistent()
+        .set(&StorageKey::VoteLocks, locks);
 }
 
 pub(crate) fn get_holders(env: &Env) -> Vec<Address> {

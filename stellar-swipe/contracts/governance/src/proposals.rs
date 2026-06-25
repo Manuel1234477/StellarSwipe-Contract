@@ -214,6 +214,7 @@ pub fn create_proposal(
     }
 
     validate_proposal(env, &proposal_type)?;
+    validate_execution_payload(&proposal_type, &execution_payload)?;
 
     let mut state = get_proposals_state(env);
     let id = state.next_proposal_id;
@@ -710,6 +711,41 @@ fn validate_proposal(env: &Env, p: &ProposalType) -> Result<(), GovernanceError>
         }
         ProposalType::ContractUpgrade(_name, hash) => {
             if hash.len() != 32 {
+                return Err(GovernanceError::InvalidProposal);
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+/// Validate the execution payload bytes against what each ProposalType expects.
+///
+/// - `ContractUpgrade`: payload must be exactly 32 bytes (new WASM hash).
+/// - `TreasurySpend`/`ParameterChange`: non-empty payload must start with a
+///   known version byte (`0x01`) so malformed blobs are caught early.
+/// - `FeatureToggle`/`SignalProposal`: no payload constraints.
+/// - `Custom`: payload must be non-empty (executor address ABI).
+pub fn validate_execution_payload(
+    proposal_type: &ProposalType,
+    payload: &Bytes,
+) -> Result<(), GovernanceError> {
+    match proposal_type {
+        ProposalType::ContractUpgrade(_, _) => {
+            // Payload encodes the new WASM hash — must be exactly 32 bytes.
+            if payload.len() != 32 {
+                return Err(GovernanceError::InvalidProposal);
+            }
+        }
+        ProposalType::TreasurySpend(_, _, _, _) | ProposalType::ParameterChange(_, _, _) => {
+            // Optional but if present must carry a recognized version prefix.
+            if payload.len() > 0 && payload.get(0) != Some(0x01) {
+                return Err(GovernanceError::InvalidProposal);
+            }
+        }
+        ProposalType::Custom(_) => {
+            // Custom proposals must supply a non-empty payload (ABI data).
+            if payload.is_empty() {
                 return Err(GovernanceError::InvalidProposal);
             }
         }
