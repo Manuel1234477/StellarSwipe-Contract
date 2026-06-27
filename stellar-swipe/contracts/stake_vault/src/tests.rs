@@ -992,4 +992,126 @@ mod slash_severity_tests {
 
         assert_eq!(client.withdraw_stake(&staker), amount);
     }
+
+    // ── Delegation tests (issue #688) ─────────────────────────────────────────
+
+    #[test]
+    fn delegate_stake_credited_separately_from_own_stake() {
+        let (env, vault_id, token, _admin, _registry) = setup();
+        let provider = Address::generate(&env);
+        let delegator = Address::generate(&env);
+        let delegate_amount: i128 = 2_000_000;
+
+        let client = StakeVaultContractClient::new(&env, &vault_id);
+        StellarAssetClient::new(&env, &token).mint(&delegator, &delegate_amount);
+        client.delegate_stake(&delegator, &provider, &delegate_amount);
+
+        assert_eq!(client.get_delegated_stake(&delegator, &provider), delegate_amount);
+        assert_eq!(client.get_total_delegated(&provider), delegate_amount);
+        assert_eq!(client.get_stake(&provider), 0, "own stake must remain zero");
+        assert_eq!(client.get_total_stake_for_provider(&provider), delegate_amount);
+    }
+
+    #[test]
+    fn delegate_stake_accumulates_from_multiple_delegators() {
+        let (env, vault_id, token, _admin, _registry) = setup();
+        let provider = Address::generate(&env);
+        let delegator_a = Address::generate(&env);
+        let delegator_b = Address::generate(&env);
+
+        let client = StakeVaultContractClient::new(&env, &vault_id);
+        StellarAssetClient::new(&env, &token).mint(&delegator_a, &3_000_000i128);
+        StellarAssetClient::new(&env, &token).mint(&delegator_b, &7_000_000i128);
+
+        client.delegate_stake(&delegator_a, &provider, &3_000_000i128);
+        client.delegate_stake(&delegator_b, &provider, &7_000_000i128);
+
+        assert_eq!(client.get_total_delegated(&provider), 10_000_000i128);
+        assert_eq!(client.get_delegated_stake(&delegator_a, &provider), 3_000_000i128);
+        assert_eq!(client.get_delegated_stake(&delegator_b, &provider), 7_000_000i128);
+    }
+
+    #[test]
+    fn delegate_and_own_stake_summed_in_total() {
+        let (env, vault_id, token, _admin, _registry) = setup();
+        let provider = Address::generate(&env);
+        let delegator = Address::generate(&env);
+        let own_amount: i128 = 5_000_000;
+        let delegate_amount: i128 = 3_000_000;
+
+        let client = StakeVaultContractClient::new(&env, &vault_id);
+        StellarAssetClient::new(&env, &token).mint(&provider, &own_amount);
+        StellarAssetClient::new(&env, &token).mint(&delegator, &delegate_amount);
+
+        client.deposit_stake(&provider, own_amount);
+        client.delegate_stake(&delegator, &provider, &delegate_amount);
+
+        assert_eq!(client.get_stake(&provider), own_amount);
+        assert_eq!(client.get_total_delegated(&provider), delegate_amount);
+        assert_eq!(
+            client.get_total_stake_for_provider(&provider),
+            own_amount + delegate_amount
+        );
+    }
+
+    #[test]
+    fn slash_applies_pro_rata_to_own_and_delegated_stake() {
+        let (env, vault_id, token, admin, registry) = setup();
+        let provider = Address::generate(&env);
+        let delegator = Address::generate(&env);
+        let own_amount: i128 = 10_000_000;
+        let delegate_amount: i128 = 10_000_000;
+
+        let client = StakeVaultContractClient::new(&env, &vault_id);
+        StellarAssetClient::new(&env, &token).mint(&provider, &own_amount);
+        StellarAssetClient::new(&env, &token).mint(&delegator, &delegate_amount);
+
+        client.deposit_stake(&provider, own_amount);
+        client.delegate_stake(&delegator, &provider, &delegate_amount);
+
+        // Minor slash (5%) — should slash both own and delegated
+        client.slash_stake(
+            &registry,
+            &provider,
+            &crate::SlashSeverity::Minor,
+            &Symbol::new(&env, "test"),
+        );
+
+        let own_after = client.get_stake(&provider);
+        let delegated_after = client.get_delegated_stake(&delegator, &provider);
+
+        // Each should have been slashed ~5%
+        assert!(own_after < own_amount, "own stake must decrease");
+        assert!(delegated_after < delegate_amount, "delegated stake must decrease");
+        // Pro-rata: both slashed equally (same tier_bps applied to each component)
+        assert_eq!(own_after, delegated_after);
+    }
+
+    #[test]
+    fn slash_reward_split_proportional_to_delegation() {
+        let (env, vault_id, token, _admin, registry) = setup();
+        let provider = Address::generate(&env);
+        let delegator = Address::generate(&env);
+        let own_amount: i128 = 6_000_000;
+        let delegate_amount: i128 = 4_000_000;
+
+        let client = StakeVaultContractClient::new(&env, &vault_id);
+        StellarAssetClient::new(&env, &token).mint(&provider, &own_amount);
+        StellarAssetClient::new(&env, &token).mint(&delegator, &delegate_amount);
+
+        client.deposit_stake(&provider, own_amount);
+        client.delegate_stake(&delegator, &provider, &delegate_amount);
+
+        // Critical slash (100%)
+        client.slash_stake(
+            &registry,
+            &provider,
+            &crate::SlashSeverity::Critical,
+            &Symbol::new(&env, "fraud"),
+        );
+
+        assert_eq!(client.get_stake(&provider), 0);
+        assert_eq!(client.get_delegated_stake(&delegator, &provider), 0);
+        assert_eq!(client.get_total_delegated(&provider), 0);
+    }
 }
