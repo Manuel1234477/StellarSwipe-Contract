@@ -112,6 +112,10 @@ pub enum StorageKey {
     MigrationCursor,
     /// Snapshot count of v1 keys at migration start (for `MigrationProgress.total_count`).
     MigrationV1TargetTotal,
+    /// Pre-migration invariant snapshot, captured at migration start (issue #597).
+    MigrationPreSnapshot,
+    /// Result of reconciling the pre-migration snapshot against migrated v2 data (issue #597).
+    MigrationVerification,
     ProviderStats,
     /// Per-provider stake balances for trust and submission gates.
     ProviderStakes,
@@ -201,6 +205,14 @@ impl SignalRegistry {
         admin::require_admin(&env, &caller)?;
         caller.require_auth();
         migration::migrate_signals_v1_to_v2(&env, &caller, batch_size)
+    }
+
+    /// Result of the most recently completed v1→v2 migration's post-migration
+    /// invariant check (issue #597): `None` until a migration run has fully
+    /// drained v1 at least once; `verified: false` flags a reconciliation
+    /// mismatch that needs manual review.
+    pub fn get_migration_verification(env: Env) -> Option<migration::MigrationVerification> {
+        migration::get_migration_verification(&env)
     }
 
     /* =========================
