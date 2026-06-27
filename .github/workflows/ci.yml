@@ -49,7 +49,10 @@ jobs:
       - name: Format check
         run: cd stellar-swipe && cargo fmt --all -- --check
 
-      # Clippy linter for all workspace crates
+      # Clippy: any warning is a build failure.
+      # Workspace-level suppressions live in [workspace.lints.clippy] in Cargo.toml
+      # and must be narrowly scoped with a documented reason.  Adding a new
+      # suppress without justification is grounds for PR rejection.
       - name: Clippy
         run: cd stellar-swipe && cargo clippy --workspace --all-targets -- -D warnings
 

@@ -49,3 +49,36 @@ Both should pass with no manual fixes required.
 
 Extend `DataKey` and `{ContractName}Error` with your contract-specific variants
 before adding business logic.
+
+## Clippy policy
+
+CI runs `cargo clippy --workspace --all-targets -- -D warnings`.  Any clippy
+warning fails the build.
+
+### Suppressing a lint
+
+- **Prefer fixing** the underlying issue over suppressing.
+- Suppressions must be **as narrow as possible**: annotate the individual item
+  (`fn`, `impl` block, expression) rather than the whole module or crate.
+- The `#[allow]` attribute must include a brief comment explaining why the
+  suppression is justified:
+
+  ```rust
+  // Soroban contract functions cannot use struct wrappers in the public ABI.
+  #[allow(clippy::too_many_arguments)]
+  pub fn my_contract_fn(env: Env, a: Address, …) { … }
+  ```
+
+- Workspace-wide suppressions live in `[workspace.lints.clippy]` in
+  `stellar-swipe/Cargo.toml` and require a PR that explains why the lint is
+  non-actionable across the whole workspace.
+
+### Requesting an exception
+
+Open a PR with the `lint-exception` label.  The PR description must include:
+
+1. The lint name and the code it fires on.
+2. Why fixing the code is not preferable.
+3. A `#[allow]` annotation scoped to the narrowest applicable span.
+
+Reviewers will merge only after confirming the suppression scope is minimal.
