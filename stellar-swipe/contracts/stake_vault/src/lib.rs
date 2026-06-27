@@ -5,7 +5,8 @@ pub mod migration;
 use migration::{MigrationKey, StakeInfoV2};
 use shared::initializable;
 use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, token, Address, Env, Symbol,
+    contract, contracterror, contractimpl, contracttype, token, Address, Env, IntoVal, Symbol, Val,
+    Vec,
 };
 
 // ── Slash severity tiers ──────────────────────────────────────────────────────
@@ -545,9 +546,29 @@ impl StakeVaultContract {
     /// 1. Reentrancy guard (temporary storage lock).
     /// 2. Same-ledger deposit+withdraw detection.
     /// 3. Time-lock for large withdrawals (>= LARGE_WITHDRAWAL_THRESHOLD).
+    ///
+    /// Authorization is scoped to `(staker, amount)` via `require_auth_for_args`
+    /// so a valid signature for one withdrawal amount cannot be replayed for a
+    /// different amount (Issue #563).
     pub fn withdraw_stake(env: Env, staker: Address) -> Result<i128, StakeVaultError> {
-        staker.require_auth();
         Self::require_not_paused(&env)?;
+
+        // Read the stake balance first so we can scope the auth signature to
+        // the exact amount being withdrawn, preventing signature reuse attacks.
+        let stakes: soroban_sdk::Map<Address, StakeInfoV2> = env
+            .storage()
+            .persistent()
+            .get(&MigrationKey::StakesV2)
+            .unwrap_or_else(|| soroban_sdk::Map::new(&env));
+        let amount_to_withdraw = stakes
+            .get(staker.clone())
+            .map(|i| i.balance)
+            .unwrap_or(0);
+
+        let mut auth_args: Vec<Val> = Vec::new(&env);
+        auth_args.push_back(staker.clone().into_val(&env));
+        auth_args.push_back(amount_to_withdraw.into_val(&env));
+        staker.require_auth_for_args(auth_args);
 
         // ── Reentrancy guard ──────────────────────────────────────────────────
         let lock_key = Symbol::new(&env, EXECUTION_LOCK);
