@@ -1951,6 +1951,21 @@ impl SignalRegistry {
         analytics::calculate_global_analytics(&env, &signals)
     }
 
+    /// Budget-aware, resumable version of `get_global_analytics` (issue #598).
+    /// Pass `cursor: None` and `accumulator: None` on the first call; if the
+    /// returned `cursor` is `Some`, pass it (and the returned accumulator)
+    /// back in to continue from where the previous call left off instead of
+    /// risking a mid-query instruction-budget failure on large datasets.
+    pub fn get_global_analytics_paginated(
+        env: Env,
+        cursor: Option<u64>,
+        accumulator: Option<analytics::GlobalAnalyticsAccumulator>,
+    ) -> analytics::PagedGlobalAnalytics {
+        let signals = Self::get_signals_map(&env);
+        let acc = accumulator.unwrap_or_else(analytics::GlobalAnalyticsAccumulator::new);
+        analytics::calculate_global_analytics_paginated(&env, &signals, cursor, acc)
+    }
+
     /// Get category-level performance analytics (Issue #419)
     /// Returns analytics for the given category, including avg success rate,
     /// avg ROI, total signals, total adopters, and top provider.
