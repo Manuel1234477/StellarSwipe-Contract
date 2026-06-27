@@ -5,6 +5,7 @@ pub mod dca;
 pub mod keeper;
 mod oracle;
 pub mod risk_gates;
+pub mod priority;
 pub mod sdex;
 pub mod triggers;
 mod wire;
@@ -59,6 +60,10 @@ pub enum StorageKey {
     CircuitBreakerLedger,
     MaxOpenInterestPerPair,
     OpenInterestPerPair(Address),
+    /// Priority-lane configuration for high-stake vs standard followers (Issue #682).
+    PriorityConfig,
+    /// Consecutive priority-only batch counter for fairness fallback (Issue #682).
+    PriorityBatchCounter,
 }
 
 /// Temporary-storage key for the reentrancy lock on `execute_copy_trade`.
@@ -1038,10 +1043,15 @@ impl TradeExecutorContract {
     /// Execute a batch of copy trades. Each trade is attempted independently;
     /// a failure in one trade does NOT roll back successful trades.
     ///
-    /// Returns a `Vec<BatchTradeResult>` with one entry per input trade, in order.
+    /// Trades are processed in priority-tier order (high-stake -> high-tenure -> standard)
+    /// when a portfolio contract is configured (Issue #682). A fairness fallback
+    /// prevents starvation of standard followers after N consecutive priority-only batches.
+    ///
+    /// Returns a Vec<BatchTradeResult> with one entry per input trade, in the
+    /// priority-sorted order (not the original input order).
     ///
     /// # Errors
-    /// - [`ContractError::InvalidAmount`] — batch is empty or exceeds `MAX_BATCH_SIZE`.
+    /// - [ContractError::InvalidAmount] - batch is empty or exceeds MAX_BATCH_SIZE.
     pub fn batch_execute(
         env: Env,
         trades: Vec<BatchTradeInput>,
@@ -1051,10 +1061,19 @@ impl TradeExecutorContract {
             return Err(ContractError::InvalidAmount);
         }
 
+        let portfolio: Option<Address> = env.storage().instance().get(&StorageKey::UserPortfolio);
+
+        // Sort trades by priority tier (Issue #682)
+        let (sorted_trades, _) = priority::sort_trades_by_priority(
+            &env,
+            trades,
+            portfolio.as_ref(),
+        );
+
         let mut results: Vec<BatchTradeResult> = Vec::new(&env);
 
         for i in 0..len {
-            let trade = trades.get(i).unwrap();
+            let trade = sorted_trades.get(i).unwrap();
             let outcome = Self::execute_copy_trade(
                 env.clone(),
                 trade.user,
