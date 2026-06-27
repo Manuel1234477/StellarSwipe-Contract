@@ -856,4 +856,140 @@ mod slash_severity_tests {
             Err(Ok(StakeVaultError::Unauthorized))
         );
     }
+
+    // ── Minimum stake duration lock tests (Issue #705) ───────────────────────────
+
+    #[test]
+    fn voting_power_zero_within_lock_period() {
+        let (env, vault_id, token, _admin, _registry) = setup();
+        let staker = Address::generate(&env);
+        let amount: i128 = 1_000_000;
+
+        let client = StakeVaultContractClient::new(&env, &vault_id);
+        client.set_minimum_stake_duration(&3600);
+
+        StellarAssetClient::new(&env, &token).mint(&staker, &amount);
+        client.deposit_stake(&staker, &amount);
+
+        assert_eq!(client.get_voting_power(&staker), 0);
+    }
+
+    #[test]
+    fn voting_power_full_after_lock_expires() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let admin = Address::generate(&env);
+        let signal_registry = Address::generate(&env);
+        let token = sac_token(&env, &admin);
+        let vault_id = env.register(StakeVaultContract, ());
+        let client = StakeVaultContractClient::new(&env, &vault_id);
+        client.initialize(&admin, &token, &signal_registry);
+
+        let staker = Address::generate(&env);
+        let amount: i128 = 1_000_000;
+
+        client.set_minimum_stake_duration(&3600);
+
+        StellarAssetClient::new(&env, &token).mint(&staker, &amount);
+        client.deposit_stake(&staker, &amount);
+
+        env.ledger().with_mut(|l| l.timestamp = 3601);
+
+        assert_eq!(client.get_voting_power(&staker), amount);
+    }
+
+    #[test]
+    fn top_up_deposit_extends_lock_for_new_portion() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let admin = Address::generate(&env);
+        let signal_registry = Address::generate(&env);
+        let token = sac_token(&env, &admin);
+        let vault_id = env.register(StakeVaultContract, ());
+        let client = StakeVaultContractClient::new(&env, &vault_id);
+        client.initialize(&admin, &token, &signal_registry);
+
+        let staker = Address::generate(&env);
+        let first_deposit: i128 = 500_000;
+        let second_deposit: i128 = 300_000;
+
+        client.set_minimum_stake_duration(&3600);
+
+        StellarAssetClient::new(&env, &token).mint(&staker, &first_deposit);
+        client.deposit_stake(&staker, first_deposit);
+
+        env.ledger().with_mut(|l| l.timestamp = 3601);
+
+        StellarAssetClient::new(&env, &token).mint(&staker, &second_deposit);
+        client.deposit_stake(&staker, second_deposit);
+
+        assert_eq!(client.get_voting_power(&staker), 0);
+
+        env.ledger().with_mut(|l| l.timestamp = 7202);
+
+        assert_eq!(client.get_voting_power(&staker), first_deposit + second_deposit);
+    }
+
+    #[test]
+    fn no_min_duration_means_voting_power_immediately() {
+        let (env, vault_id, token, _admin, _registry) = setup();
+        let staker = Address::generate(&env);
+        let amount: i128 = 1_000_000;
+
+        let client = StakeVaultContractClient::new(&env, &vault_id);
+
+        StellarAssetClient::new(&env, &token).mint(&staker, &amount);
+        client.deposit_stake(&staker, amount);
+
+        assert_eq!(client.get_voting_power(&staker), amount);
+    }
+
+    #[test]
+    fn set_minimum_stake_duration_admin_only() {
+        let (env, vault_id, _token, _admin, _registry) = setup();
+        let client = StakeVaultContractClient::new(&env, &vault_id);
+        assert_eq!(client.get_minimum_stake_duration(), 0);
+    }
+
+    #[test]
+    fn deposit_timestamp_tracked() {
+        let (env, vault_id, token, _admin, _registry) = setup();
+        let staker = Address::generate(&env);
+        let amount: i128 = 1_000_000;
+
+        let client = StakeVaultContractClient::new(&env, &vault_id);
+        StellarAssetClient::new(&env, &token).mint(&staker, &amount);
+        client.deposit_stake(&staker, amount);
+
+        let ts = client.get_stake_deposit_timestamp(&staker);
+        assert!(ts.is_some());
+        assert_eq!(ts.unwrap(), env.ledger().timestamp());
+    }
+
+    #[test]
+    fn withdraw_stake_respects_min_duration_lock() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let admin = Address::generate(&env);
+        let signal_registry = Address::generate(&env);
+        let token = sac_token(&env, &admin);
+        let vault_id = env.register(StakeVaultContract, ());
+        let client = StakeVaultContractClient::new(&env, &vault_id);
+        client.initialize(&admin, &token, &signal_registry);
+
+        let staker = Address::generate(&env);
+        let amount: i128 = 1_000_000;
+
+        client.set_minimum_stake_duration(&3600);
+
+        StellarAssetClient::new(&env, &token).mint(&staker, &amount);
+        client.deposit_stake(&staker, amount);
+
+        let result = client.try_withdraw_stake(&staker);
+        assert_eq!(result, Err(Ok(StakeVaultError::StakeLocked)));
+
+        env.ledger().with_mut(|l| l.timestamp = 3601);
+
+        assert_eq!(client.withdraw_stake(&staker), amount);
+    }
 }

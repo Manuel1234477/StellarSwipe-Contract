@@ -5,6 +5,7 @@
 mod achievements;
 mod badges;
 mod migration;
+mod position_tags;
 mod onboarding;
 #[cfg(test)]
 #[path = "tests/mod.rs"]
@@ -710,6 +711,33 @@ impl UserPortfolio {
     /// Returns whether the user has completed the quest identified by `quest_id`.
     pub fn verify_quest_completion(env: Env, user: Address, quest_id: u32) -> bool {
         achievements::verify_quest_completion(&env, &user, quest_id)
+    }
+
+    // ── Issue #703: Custom position tagging ─────────────────────────────────────
+
+    /// Tag a position owned by `user` with a custom string label.
+    ///
+    /// - Only the position owner may call this.
+    /// - `tag` must be 1–32 characters.
+    /// - Retagging overwrites the previous tag.
+    /// - Emits `PositionTagged` event.
+    pub fn tag_position(env: Env, user: Address, position_id: u64, tag: String) {
+        position_tags::tag_position(&env, user, position_id, tag).unwrap();
+    }
+
+    /// Remove a tag from a position owned by `user`.
+    pub fn untag_position(env: Env, user: Address, position_id: u64) {
+        position_tags::untag_position(&env, user, position_id);
+    }
+
+    /// Returns all position IDs for `user` that have been tagged with `tag`.
+    pub fn get_positions_by_tag(env: Env, user: Address, tag: String) -> Vec<u64> {
+        position_tags::get_positions_by_tag(&env, user, tag)
+    }
+
+    /// Returns the tag (if any) for a specific position owned by `user`.
+    pub fn get_position_tag(env: Env, user: Address, position_id: u64) -> Option<String> {
+        position_tags::get_position_tag(&env, user, position_id)
     }
 
     fn require_admin(env: &Env) {

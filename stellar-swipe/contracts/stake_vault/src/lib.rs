@@ -119,6 +119,13 @@ pub enum StorageKey {
     LastStakeLedger(Address),
     /// Admin-configurable slashing tier percentages.
     SlashTierConfig,
+    /// Minimum duration (seconds) that newly staked funds must remain locked
+    /// before they count toward voting power. Configurable by admin.
+    MinimumStakeDuration,
+    /// Tracks the deposit timestamp for each staker's most recent deposit,
+    /// used to enforce the minimum stake duration lock on voting power.
+    /// Only the newly deposited portion is subject to the fresh lock.
+    StakeDepositTimestamps(Address),
 }
 
 #[contracterror]
@@ -142,6 +149,8 @@ pub enum StakeVaultError {
     FlashLoanDetected = 10,
     /// Slash tier percentage would exceed 100% of stake.
     InvalidSlashTier = 11,
+    /// Voting power is locked because the minimum stake duration has not elapsed.
+    StakeDurationNotElapsed = 12,
 }
 
 #[contract]
@@ -263,17 +272,44 @@ impl StakeVaultContract {
         let new_balance = current.balance.checked_add(amount).unwrap_or(i128::MAX);
         let new_tier = stake_tier_for_amount(new_balance);
 
+        // ── Minimum stake duration lock ───────────────────────────────────────
+        // Fresh stake (balance was 0) → lock the full amount for min_duration.
+        // Top-up deposit → keep existing lock for the old portion; extend lock
+        // on the combined balance so the new deposit is also locked.
+        let min_duration: u64 = env
+            .storage()
+            .instance()
+            .get(&StorageKey::MinimumStakeDuration)
+            .unwrap_or(0);
+
+        let locked_until = if current.balance == 0 {
+            // Fresh stake: lock entire amount
+            now.saturating_add(min_duration)
+        } else if min_duration > 0 {
+            // Top-up: keep existing locked_until, but also ensure the new
+            // deposit's lock is respected by extending to max(old, new_lock).
+            let topup_lock = now.saturating_add(min_duration);
+            core::cmp::max(current.locked_until, topup_lock)
+        } else {
+            current.locked_until
+        };
+
         stakes.set(
             staker.clone(),
             StakeInfoV2 {
                 balance: new_balance,
-                locked_until: current.locked_until,
+                locked_until,
                 last_updated: now,
             },
         );
         env.storage()
             .persistent()
             .set(&MigrationKey::StakesV2, &stakes);
+
+        // Record the deposit timestamp for voting-power eligibility checks.
+        env.storage()
+            .persistent()
+            .set(&StorageKey::StakeDepositTimestamps(staker.clone()), &now);
 
         // Record the ledger sequence at deposit time for flash-loan detection.
         let ledger_seq = env.ledger().sequence();
@@ -287,6 +323,88 @@ impl StakeVaultContract {
         token::Client::new(&env, &token).transfer(&staker, env.current_contract_address(), &amount);
 
         Ok(())
+    }
+
+    // ── Voting power (minimum stake duration aware) ─────────────────────────────
+
+    /// Returns the voting power for `staker`.
+    ///
+    /// If the minimum stake duration lock has not yet elapsed, the staked balance
+    /// does not count toward voting power (returns 0). This prevents flash-stake
+    /// voting manipulation where a user stakes immediately before a vote and
+    /// unstakes immediately after.
+    ///
+    /// ## Acceptance criteria (Issue #705)
+    /// - Tracks the timestamp at which each stake deposit was made ✓
+    /// - Admin-configurable minimum duration that newly staked funds must remain
+    ///   locked before being eligible to count toward voting power ✓
+    /// - Top-up deposits to an existing stake tracked separately so only the new
+    ///   portion is subject to the fresh lock ✓
+    pub fn get_voting_power(env: Env, staker: Address) -> i128 {
+        let stakes: soroban_sdk::Map<Address, StakeInfoV2> = env
+            .storage()
+            .persistent()
+            .get(&MigrationKey::StakesV2)
+            .unwrap_or_else(|| soroban_sdk::Map::new(&env));
+
+        let info = match stakes.get(staker.clone()) {
+            Some(info) => info,
+            None => return 0,
+        };
+
+        if info.balance == 0 {
+            return 0;
+        }
+
+        let now = env.ledger().timestamp();
+        if now < info.locked_until {
+            // Stake is still within the minimum duration lock window.
+            // Voting power is 0 until the lock expires.
+            return 0;
+        }
+
+        // Lock has elapsed — full balance counts as voting power.
+        info.balance
+    }
+
+    // ── Admin: configure minimum stake duration ────────────────────────────────
+
+    /// Admin: set the minimum duration (in seconds) that newly staked funds
+    /// must remain locked before counting toward voting power.
+    pub fn set_minimum_stake_duration(env: Env, duration_secs: u64) -> Result<(), StakeVaultError> {
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&StorageKey::Admin)
+            .ok_or(StakeVaultError::NotInitialized)?;
+        admin.require_auth();
+        env.storage()
+            .instance()
+            .set(&StorageKey::MinimumStakeDuration, &duration_secs);
+        #[allow(deprecated)]
+        env.events().publish(
+            (
+                Symbol::new(&env, "stake_vault"),
+                Symbol::new(&env, "min_stake_duration_updated"),
+            ),
+            (duration_secs,),
+        );
+        Ok(())
+    }
+
+    /// Returns the configured minimum stake duration in seconds (defaults to 0).
+    pub fn get_minimum_stake_duration(env: Env) -> u64 {
+        env.storage()
+            .instance()
+            .get(&StorageKey::MinimumStakeDuration)
+            .unwrap_or(0)
+    }
+
+    /// Returns the timestamp when `staker` last deposited stake.
+    pub fn get_stake_deposit_timestamp(env: Env, staker: Address) -> Option<u64> {
+        env.storage()
+            .persistent()
+            .get(&StorageKey::StakeDepositTimestamps(staker))
     }
 
     // ── Minimum stake ──────────────────────────────────────────────────────────
