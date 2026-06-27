@@ -3,7 +3,7 @@
 pub mod migration;
 
 use migration::{MigrationKey, StakeInfoV2};
-use shared::initializable;
+use shared::{initializable, pausable};
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, token, Address, Env, Symbol,
 };
@@ -110,8 +110,6 @@ pub enum StorageKey {
     /// Timestamp when a provider's stake first dropped below minimum.
     /// `None` means stake is currently at or above minimum.
     StakeBelowMinSince(Address),
-    /// Emergency pause flag — when true all stake/unstake ops are blocked.
-    Paused,
     /// Timestamp when a large-withdrawal request was initiated (per staker).
     LargeWithdrawalRequestedAt(Address),
     /// Ledger sequence at which a stake was last deposited (per staker).
@@ -170,13 +168,19 @@ impl StakeVaultContract {
         env.storage()
             .instance()
             .set(&StorageKey::SignalRegistry, &signal_registry);
-        env.storage().instance().set(&StorageKey::Paused, &false);
+        // Initialize pause state to false via shared::pausable (no event on init).
+        env.storage()
+            .instance()
+            .set(&pausable::PausableKey::Paused, &false);
         initializable::mark_initialized(&env);
     }
 
-    // ── Emergency pause ────────────────────────────────────────────────────────
+    // ── Emergency pause (shared::pausable) ────────────────────────────────────
 
     /// Admin: pause all stake/unstake operations.
+    ///
+    /// Uses the shared [`pausable`] module so pause behavior and event shape
+    /// are consistent across all contracts that adopt it (Issue #561).
     pub fn pause(env: Env) {
         let admin: Address = env
             .storage()
@@ -184,15 +188,7 @@ impl StakeVaultContract {
             .get(&StorageKey::Admin)
             .expect("not initialized");
         admin.require_auth();
-        env.storage().instance().set(&StorageKey::Paused, &true);
-        #[allow(deprecated)]
-        env.events().publish(
-            (
-                Symbol::new(&env, "stake_vault"),
-                Symbol::new(&env, "paused"),
-            ),
-            (),
-        );
+        pausable::set_paused(&env, true);
     }
 
     /// Admin: resume operations.
@@ -203,36 +199,17 @@ impl StakeVaultContract {
             .get(&StorageKey::Admin)
             .expect("not initialized");
         admin.require_auth();
-        env.storage().instance().set(&StorageKey::Paused, &false);
-        #[allow(deprecated)]
-        env.events().publish(
-            (
-                Symbol::new(&env, "stake_vault"),
-                Symbol::new(&env, "unpaused"),
-            ),
-            (),
-        );
+        pausable::set_paused(&env, false);
     }
 
     pub fn is_paused(env: Env) -> bool {
-        env.storage()
-            .instance()
-            .get(&StorageKey::Paused)
-            .unwrap_or(false)
+        pausable::is_paused(&env)
     }
 
     // ── Helpers ────────────────────────────────────────────────────────────────
 
     fn require_not_paused(env: &Env) -> Result<(), StakeVaultError> {
-        if env
-            .storage()
-            .instance()
-            .get::<_, bool>(&StorageKey::Paused)
-            .unwrap_or(false)
-        {
-            return Err(StakeVaultError::ContractPaused);
-        }
-        Ok(())
+        pausable::require_not_paused(env).map_err(|_| StakeVaultError::ContractPaused)
     }
 
     // ── Deposit stake (records ledger for flash-loan detection) ────────────────
