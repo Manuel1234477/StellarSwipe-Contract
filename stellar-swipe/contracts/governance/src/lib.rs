@@ -97,6 +97,15 @@ pub use treasury::{
 const DEFAULT_LIQUIDITY_REWARD_BPS: u32 = 100;
 const DEFAULT_MIN_CLAIM_THRESHOLD: i128 = 100;
 
+soroban_sdk::contractmeta!(
+    key = "SourceHash",
+    val = env!("STELLAR_SOURCE_HASH")
+);
+soroban_sdk::contractmeta!(
+    key = "GitCommit",
+    val = env!("STELLAR_GIT_COMMIT")
+);
+
 #[contract]
 pub struct GovernanceContract;
 

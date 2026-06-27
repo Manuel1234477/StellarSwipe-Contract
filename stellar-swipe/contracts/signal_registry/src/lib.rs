@@ -98,6 +98,15 @@ use versioning::{CopyRecord, SignalVersion};
 const MAX_EXPIRY_SECONDS: u64 = SECONDS_PER_30_DAY_MONTH;
 const WARNING_WINDOW_LEDGERS: u64 = 720;
 
+soroban_sdk::contractmeta!(
+    key = "SourceHash",
+    val = env!("STELLAR_SOURCE_HASH")
+);
+soroban_sdk::contractmeta!(
+    key = "GitCommit",
+    val = env!("STELLAR_GIT_COMMIT")
+);
+
 #[contract]
 pub struct SignalRegistry;
 

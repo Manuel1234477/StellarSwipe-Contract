@@ -80,8 +80,20 @@ jobs:
           chmod +x "$install_dir/stellar"
           stellar --version
 
-      - name: Build optimized Soroban WASM
-        run: cd stellar-swipe && chmod +x scripts/build.sh && ./scripts/build.sh
+      - name: Build optimized Soroban WASM (with source hash)
+        run: |
+          cd stellar-swipe
+          chmod +x scripts/embed_source_hash.sh scripts/build.sh
+          # embed_source_hash.sh exports STELLAR_SOURCE_HASH; build.sh verifies
+          # it is non-empty before proceeding.  The build fails if the hash
+          # cannot be computed (missing git history, empty workspace, etc.).
+          source scripts/embed_source_hash.sh
+          ./scripts/build.sh
+          if [[ -z "${STELLAR_SOURCE_HASH:-}" ]]; then
+            echo "error: STELLAR_SOURCE_HASH was not set — release aborted." >&2
+            exit 1
+          fi
+          echo "Embedded SourceHash: $STELLAR_SOURCE_HASH"
 
       - name: Upload optimized WASM artifacts
         uses: actions/upload-artifact@v4
