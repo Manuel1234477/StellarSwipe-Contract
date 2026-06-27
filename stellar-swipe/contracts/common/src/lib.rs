@@ -10,6 +10,8 @@ pub mod health;
 #[allow(deprecated)]
 pub mod multisig;
 pub mod oracle;
+/// Structured panic message convention for intentional panics (issue #596).
+pub mod panic_codes;
 pub mod perf;
 #[allow(deprecated)]
 pub mod rate_limit;
