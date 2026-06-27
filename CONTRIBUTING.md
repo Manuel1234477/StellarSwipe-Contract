@@ -50,6 +50,44 @@ Both should pass with no manual fixes required.
 Extend `DataKey` and `{ContractName}Error` with your contract-specific variants
 before adding business logic.
 
+## Error code stability
+
+Every `#[contracterror]` enum has a baseline JSON file in
+`stellar-swipe/error-baselines/<crate>.json`.  CI runs
+`scripts/check_error_codes.py` on every PR and fails (exit 1) if:
+
+- An existing variant's numeric discriminant changed (renumbering).
+- A numeric value that was previously assigned to one variant is now used for
+  a different variant (reuse).
+
+Adding a brand-new variant with a **previously-unused** number is allowed;
+the script updates the baseline automatically and exits 2 (informational).
+
+### Adding a new error code
+
+1. Add the variant to the enum with the next unused number.
+2. Run `python3 stellar-swipe/scripts/check_error_codes.py` locally — it
+   exits 2 and writes the updated baseline file.
+3. `git add stellar-swipe/error-baselines/<crate>.json` and include it in
+   your PR.
+
+### Deprecating an error code
+
+1. **Never reuse the number.**
+2. Add the variant to a `"deprecated"` list in the baseline JSON:
+   ```json
+   "deprecated": { "OldVariantName": 42 }
+   ```
+3. Remove (or keep) the Rust variant as a `// deprecated` constant — do not
+   reassign its discriminant.
+4. Open a PR with the `error-code-deprecation` label for reviewer awareness.
+
+### Why numbers must never change
+
+Clients (SDKs, indexers, monitoring tools) identify errors by their numeric
+code in the XDR envelope.  Renumbering or reusing a code silently breaks
+those clients even though the Rust code still compiles.
+
 ## Dependency policy
 
 CI runs `cargo deny check` (via `stellar-swipe/deny.toml`) on every PR that

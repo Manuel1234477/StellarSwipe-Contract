@@ -78,6 +78,22 @@ jobs:
       - name: Verify #![no_std] compliance
         run: python3 stellar-swipe/scripts/verify_no_std.py
 
+      # Guard against renumbering or reusing #[contracterror] discriminants.
+      # Exit 0 = clean; exit 2 = new codes added (baseline updated, commit the
+      # JSON files); exit 1 = renumbering/reuse detected → fail the build.
+      - name: Check error code baselines
+        run: |
+          python3 stellar-swipe/scripts/check_error_codes.py
+          rc=$?
+          if [ $rc -eq 1 ]; then
+            echo "ERROR: error code violation detected — see output above." >&2
+            exit 1
+          fi
+          if [ $rc -eq 2 ]; then
+            echo "INFO: new error codes added; baseline files updated."
+            echo "Please commit the updated stellar-swipe/error-baselines/*.json files."
+          fi
+
       # Release WASM (workspace [profile.release]) + stellar contract optimize
       # Prebuilt release binary — avoids compiling libdbus-sys from source via cargo install
       - name: Install Stellar CLI
