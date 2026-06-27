@@ -142,6 +142,8 @@ pub enum StakeVaultError {
     FlashLoanDetected = 10,
     /// Slash tier percentage would exceed 100% of stake.
     InvalidSlashTier = 11,
+    /// Too many withdrawals within the configured rate-limit window (Issue #595).
+    RateLimitExceeded = 12,
 }
 
 #[contract]
@@ -431,6 +433,17 @@ impl StakeVaultContract {
         staker.require_auth();
         Self::require_not_paused(&env)?;
 
+        // Rate-limit withdrawals via the shared rate limiter (Issue #595), adopted
+        // here through common::rate_limit's StakeChange action — the same shared
+        // mechanism already used by signal_registry for stake changes.
+        stellar_swipe_common::rate_limit::check_rate_limit(
+            &env,
+            &staker,
+            stellar_swipe_common::rate_limit::ActionType::StakeChange,
+            0,
+        )
+        .map_err(|_| StakeVaultError::RateLimitExceeded)?;
+
         // ── Reentrancy guard ──────────────────────────────────────────────────
         let lock_key = Symbol::new(&env, EXECUTION_LOCK);
         if env
@@ -446,6 +459,15 @@ impl StakeVaultContract {
         let result = Self::do_withdraw(&env, &staker);
 
         env.storage().temporary().remove(&lock_key);
+
+        if result.is_ok() {
+            stellar_swipe_common::rate_limit::record_action(
+                &env,
+                &staker,
+                stellar_swipe_common::rate_limit::ActionType::StakeChange,
+            );
+        }
+
         result
     }
 

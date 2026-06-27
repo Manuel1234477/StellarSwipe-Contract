@@ -11,6 +11,9 @@ pub mod events;
 /// Shared double-initialization guard (issue #584).
 pub mod initializable;
 pub mod math;
+/// Shared fixed-window rate limiter, consolidated from per-contract implementations
+/// (issue #595).
+pub mod rate_limiter;
 #[allow(deprecated)]
 pub mod version;
 
