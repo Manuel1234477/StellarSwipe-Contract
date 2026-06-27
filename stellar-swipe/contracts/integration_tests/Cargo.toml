@@ -1,0 +1,33 @@
+[package]
+name = "integration_tests"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[lib]
+crate-type = ["lib"]
+doctest = false
+
+[dependencies]
+soroban-sdk = { workspace = true }
+stake_vault = { path = "../stake_vault" }
+
+[dev-dependencies]
+soroban-sdk = { workspace = true, features = ["testutils"] }
+signal_registry = { path = "../signal_registry", features = ["testutils"] }
+stellar_swipe_common = { path = "../common" }
+
+[[test]]
+name = "test_contract_upgrade"
+path = "tests/integration/test_contract_upgrade.rs"
+
+[[test]]
+name = "test_complete_user_journey"
+path = "tests/integration/test_complete_user_journey.rs"
+
+[[test]]
+name = "test_multisig_governance"
+path = "tests/integration/test_multisig_governance.rs"
+
+[lints]
+workspace = true

@@ -1,22 +1,10 @@
- feature/signal-categorization-tagging
-feature/signal-categorization-tagging
-=======
- feature/oracle-price-conversion
- main
 //! Oracle error types
 
-=======
- main
 use soroban_sdk::contracterror;
 
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum OracleError {
- feature/signal-categorization-tagging
- feature/signal-categorization-tagging
-=======
- feature/oracle-price-conversion
- main
     PriceNotFound = 1,
     NoConversionPath = 2,
     InvalidPath = 3,
@@ -24,12 +12,22 @@ pub enum OracleError {
     Unauthorized = 5,
     InvalidAsset = 6,
     StalePrice = 7,
-=======
-    Unauthorized = 1,
-    OracleNotFound = 2,
-    InvalidPrice = 3,
-    OracleAlreadyExists = 4,
-    InsufficientOracles = 5,
-    LowReputation = 6,
- main
+    OracleNotFound = 8,
+    InvalidPrice = 9,
+    OracleAlreadyExists = 10,
+    InsufficientOracles = 11,
+    LowReputation = 12,
+    InsufficientHistoricalData = 13,
+    UnreliablePrice = 14,
+    NoPathFound = 15,
+    SlippageExceeded = 16,
+    EmptyOrderBook = 17,
+    WideSpreadDetected = 18,
+    InsufficientLiquidity = 19,
+    Overflow = 20,
+    CircuitBreakerTripped = 21,
+    PriceStaleTradeBlocked = 22,
+    PendingAdminNotFound = 23,
+    PendingAdminExpired = 24,
+    InsufficientSources = 25,
 }

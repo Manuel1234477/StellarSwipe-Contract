@@ -1,7 +1,14 @@
 #![cfg(test)]
 
 use super::*;
-use soroban_sdk::{testutils::Address as _, Address, Env};
+use soroban_sdk::{testutils::Address as _, Address, Env, String};
+
+fn xlm_asset(env: &Env) -> Asset {
+    Asset {
+        code: String::from_str(env, "XLM"),
+        issuer: None,
+    }
+}
 
 fn create_test_env() -> (Env, Address, Address, Address, Address) {
     let env = Env::default();
@@ -20,7 +27,7 @@ fn test_initialize() {
     let contract_id = env.register_contract(None, OracleContract);
     let client = OracleContractClient::new(&env, &contract_id);
 
-    client.initialize(&admin);
+    client.initialize(&admin, &xlm_asset(&env));
 
     // Should panic on second init
     // client.initialize(&admin); // Uncomment to test panic
@@ -32,7 +39,7 @@ fn test_register_oracle() {
     let contract_id = env.register_contract(None, OracleContract);
     let client = OracleContractClient::new(&env, &contract_id);
 
-    client.initialize(&admin);
+    client.initialize(&admin, &xlm_asset(&env));
     client.register_oracle(&admin, &oracle1);
 
     let reputation = client.get_oracle_reputation(&oracle1);
@@ -47,7 +54,7 @@ fn test_submit_price() {
     let contract_id = env.register_contract(None, OracleContract);
     let client = OracleContractClient::new(&env, &contract_id);
 
-    client.initialize(&admin);
+    client.initialize(&admin, &xlm_asset(&env));
     client.register_oracle(&admin, &oracle1);
 
     client.submit_price(&oracle1, &100_000_000);
@@ -63,7 +70,7 @@ fn test_reputation_calculation_accurate_oracle() {
     let contract_id = env.register_contract(None, OracleContract);
     let client = OracleContractClient::new(&env, &contract_id);
 
-    client.initialize(&admin);
+    client.initialize(&admin, &xlm_asset(&env));
     client.register_oracle(&admin, &oracle1);
     client.register_oracle(&admin, &oracle2);
     client.register_oracle(&admin, &oracle3);
@@ -94,7 +101,7 @@ fn test_weight_adjustment() {
     let contract_id = env.register_contract(None, OracleContract);
     let client = OracleContractClient::new(&env, &contract_id);
 
-    client.initialize(&admin);
+    client.initialize(&admin, &xlm_asset(&env));
     client.register_oracle(&admin, &oracle1);
     client.register_oracle(&admin, &oracle2);
     client.register_oracle(&admin, &oracle3);
@@ -120,7 +127,7 @@ fn test_slash_for_major_deviation() {
     let contract_id = env.register_contract(None, OracleContract);
     let client = OracleContractClient::new(&env, &contract_id);
 
-    client.initialize(&admin);
+    client.initialize(&admin, &xlm_asset(&env));
     client.register_oracle(&admin, &oracle1);
     client.register_oracle(&admin, &oracle2);
     client.register_oracle(&admin, &oracle3);
@@ -144,7 +151,7 @@ fn test_oracle_removal_for_poor_performance() {
     let contract_id = env.register_contract(None, OracleContract);
     let client = OracleContractClient::new(&env, &contract_id);
 
-    client.initialize(&admin);
+    client.initialize(&admin, &xlm_asset(&env));
     client.register_oracle(&admin, &oracle1);
     client.register_oracle(&admin, &oracle2);
     client.register_oracle(&admin, &oracle3);
@@ -180,7 +187,7 @@ fn test_reputation_recovery() {
     let contract_id = env.register_contract(None, OracleContract);
     let client = OracleContractClient::new(&env, &contract_id);
 
-    client.initialize(&admin);
+    client.initialize(&admin, &xlm_asset(&env));
     client.register_oracle(&admin, &oracle1);
     client.register_oracle(&admin, &oracle2);
     client.register_oracle(&admin, &oracle3);
@@ -216,7 +223,7 @@ fn test_weighted_median() {
     let contract_id = env.register_contract(None, OracleContract);
     let client = OracleContractClient::new(&env, &contract_id);
 
-    client.initialize(&admin);
+    client.initialize(&admin, &xlm_asset(&env));
     client.register_oracle(&admin, &oracle1);
     client.register_oracle(&admin, &oracle2);
     client.register_oracle(&admin, &oracle3);
@@ -242,7 +249,7 @@ fn test_minimum_oracles_maintained() {
     let contract_id = env.register_contract(None, OracleContract);
     let client = OracleContractClient::new(&env, &contract_id);
 
-    client.initialize(&admin);
+    client.initialize(&admin, &xlm_asset(&env));
     client.register_oracle(&admin, &oracle1);
     client.register_oracle(&admin, &oracle2);
     client.register_oracle(&admin, &oracle3);
@@ -287,7 +294,7 @@ fn test_invalid_price_rejected() {
     let contract_id = env.register_contract(None, OracleContract);
     let client = OracleContractClient::new(&env, &contract_id);
 
-    client.initialize(&admin);
+    client.initialize(&admin, &xlm_asset(&env));
     client.register_oracle(&admin, &oracle1);
 
     let result = client.try_submit_price(&oracle1, &0);
@@ -304,8 +311,119 @@ fn test_unregistered_oracle_cannot_submit() {
     let contract_id = env.register_contract(None, OracleContract);
     let client = OracleContractClient::new(&env, &contract_id);
 
-    client.initialize(&admin);
+    client.initialize(&admin, &xlm_asset(&env));
 
     let result = client.try_submit_price(&unregistered, &100_000_000);
+    assert!(result.is_err());
+}
+
+// ── Issue #602: minimum independent source count ─────────────────────────────
+
+fn usdc_xlm_pair(env: &Env) -> stellar_swipe_common::AssetPair {
+    use stellar_swipe_common::Asset;
+    stellar_swipe_common::AssetPair {
+        base: Asset {
+            code: soroban_sdk::String::from_str(env, "USDC"),
+            issuer: None,
+        },
+        quote: Asset {
+            code: soroban_sdk::String::from_str(env, "XLM"),
+            issuer: None,
+        },
+    }
+}
+
+#[test]
+fn test_min_source_count_default_zero_allows_single_source() {
+    let (env, admin, oracle1, _, _) = create_test_env();
+    let contract_id = env.register_contract(None, OracleContract);
+    let client = OracleContractClient::new(&env, &contract_id);
+
+    client.initialize(&admin, &xlm_asset(&env));
+    client.add_price_source(&admin, &oracle1, &1u32);
+
+    let pair = usdc_xlm_pair(&env);
+    client.submit_pair_price(&oracle1, &pair, &1_000_000, &100u32);
+
+    // With default min_source_count=0, one source is enough.
+    let result = client.try_get_price_with_confidence(&pair);
+    assert!(result.is_ok());
+}
+
+#[test]
+fn test_below_min_sources_returns_insufficient_sources() {
+    let (env, admin, oracle1, _, _) = create_test_env();
+    let contract_id = env.register_contract(None, OracleContract);
+    let client = OracleContractClient::new(&env, &contract_id);
+
+    client.initialize(&admin, &xlm_asset(&env));
+    client.add_price_source(&admin, &oracle1, &1u32);
+
+    // Require at least 2 sources.
+    client.set_min_source_count(&admin, &2u32);
+    assert_eq!(client.get_min_source_count(), 2u32);
+
+    let pair = usdc_xlm_pair(&env);
+    client.submit_pair_price(&oracle1, &pair, &1_000_000, &100u32);
+
+    // Only 1 fresh source — should fail with InsufficientSources.
+    let err = client.try_get_price_with_confidence(&pair);
+    assert!(err.is_err());
+}
+
+#[test]
+fn test_at_min_sources_accepted() {
+    let (env, admin, oracle1, oracle2, _) = create_test_env();
+    let contract_id = env.register_contract(None, OracleContract);
+    let client = OracleContractClient::new(&env, &contract_id);
+
+    client.initialize(&admin, &xlm_asset(&env));
+    client.add_price_source(&admin, &oracle1, &1u32);
+    client.add_price_source(&admin, &oracle2, &1u32);
+
+    client.set_min_source_count(&admin, &2u32);
+
+    let pair = usdc_xlm_pair(&env);
+    client.submit_pair_price(&oracle1, &pair, &1_000_000, &100u32);
+    client.submit_pair_price(&oracle2, &pair, &1_000_000, &100u32);
+
+    // Exactly 2 sources — must be accepted.
+    let result = client.try_get_price_with_confidence(&pair);
+    assert!(result.is_ok());
+}
+
+#[test]
+fn test_above_min_sources_accepted() {
+    let (env, admin, oracle1, oracle2, oracle3) = create_test_env();
+    let contract_id = env.register_contract(None, OracleContract);
+    let client = OracleContractClient::new(&env, &contract_id);
+
+    client.initialize(&admin, &xlm_asset(&env));
+    client.add_price_source(&admin, &oracle1, &1u32);
+    client.add_price_source(&admin, &oracle2, &1u32);
+    client.add_price_source(&admin, &oracle3, &1u32);
+
+    client.set_min_source_count(&admin, &2u32);
+
+    let pair = usdc_xlm_pair(&env);
+    client.submit_pair_price(&oracle1, &pair, &1_000_000, &100u32);
+    client.submit_pair_price(&oracle2, &pair, &1_000_000, &100u32);
+    client.submit_pair_price(&oracle3, &pair, &1_000_000, &100u32);
+
+    // 3 sources >= min 2 — accepted.
+    let result = client.try_get_price_with_confidence(&pair);
+    assert!(result.is_ok());
+}
+
+#[test]
+fn test_min_source_count_admin_only() {
+    let (env, admin, oracle1, _, _) = create_test_env();
+    let contract_id = env.register_contract(None, OracleContract);
+    let client = OracleContractClient::new(&env, &contract_id);
+
+    client.initialize(&admin, &xlm_asset(&env));
+
+    // Non-admin should not be able to set min source count.
+    let result = client.try_set_min_source_count(&oracle1, &3u32);
     assert!(result.is_err());
 }

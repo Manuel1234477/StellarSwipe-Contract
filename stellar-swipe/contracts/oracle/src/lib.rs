@@ -1,24 +1,18 @@
 #![no_std]
 
- feature/signal-categorization-tagging
- feature/signal-categorization-tagging
-=======
- feature/oracle-price-conversion
- main
+#[allow(deprecated)]
+mod admin;
 mod conversion;
 mod errors;
-mod storage;
-
-use soroban_sdk::{contract, contractimpl, Address, Env};
-use common::{Asset, AssetPair};
-use errors::OracleError;
-
-pub use conversion::{convert_to_base, ConversionPath};
-pub use storage::{get_base_currency, set_base_currency, get_price, set_price};
-=======
-mod errors;
+#[allow(deprecated)]
 mod events;
+mod external_adapter;
+mod history;
+mod multi_hop;
 mod reputation;
+mod sdex;
+mod staleness;
+mod storage;
 mod types;
 
 use errors::OracleError;
@@ -26,42 +20,92 @@ use reputation::{
     adjust_oracle_weight, calculate_reputation, get_oracle_stats, should_remove_oracle,
     slash_oracle, track_oracle_accuracy, SlashReason,
 };
-use soroban_sdk::{contract, contractimpl, Address, Env, Vec};
- feature/signal-categorization-tagging
-use types::{ConsensusPriceData, OracleReputation, PriceSubmission, StorageKey};
- main
-=======
-use types::{ConsensusPriceData, OracleReputation, PriceSubmission, StorageKey}; main
- main
+use sdex::{calculate_spot_price, OrderBook};
+use soroban_sdk::{contract, contractimpl, symbol_short, Address, Env, Map, String, Vec};
+use staleness::{OracleHealth, OracleStatus, StalenessLevel};
+use stellar_swipe_common::emergency::{PauseState, CAT_ALL};
+use stellar_swipe_common::{
+    health_uninitialized, placeholder_admin, Asset, AssetPair, HealthStatus,
+};
+use types::{
+    ConsensusPriceData, ExternalPrice, OracleReputation, PriceData, PriceSubmission, StorageKey,
+};
+
+pub use conversion::{convert_to_base, ConversionPath};
+pub use history::{calculate_twap, get_historical_price, get_twap_deviation, store_price};
+pub use multi_hop::{calculate_multi_hop_price, find_optimal_path, LiquidityPath};
+pub use storage::{get_base_currency, get_price, set_base_currency, set_price};
 
 #[contract]
 pub struct OracleContract;
 
 #[contractimpl]
 impl OracleContract {
- feature/signal-categorization-tagging
- feature/signal-categorization-tagging
-=======
- feature/oracle-price-conversion
- main
-    /// Initialize oracle with base currency
+    /// # Summary
+    /// One-time oracle initialization. Sets the admin and base currency.
+    ///
+    /// # Parameters
+    /// - `env`: Soroban environment.
+    /// - `admin`: Address that will hold admin privileges.
+    /// - `base_currency`: The base asset all prices are quoted against.
+    ///
+    /// # Returns
+    /// Nothing. Panics if already initialized.
     pub fn initialize(env: Env, admin: Address, base_currency: Asset) {
+        if env.storage().instance().has(&StorageKey::Admin) {
+            panic!("already initialized");
+        }
+        env.storage().instance().set(&StorageKey::Admin, &admin);
         storage::set_base_currency(&env, base_currency);
     }
 
-    /// Set price for an asset pair
+    /// Read-only health probe for monitoring and front-ends (no auth).
+    pub fn health_check(env: Env) -> HealthStatus {
+        let version = String::from_str(&env, env!("CARGO_PKG_VERSION"));
+        if !env.storage().instance().has(&StorageKey::Admin) {
+            return health_uninitialized(&env, version);
+        }
+        let admin = env
+            .storage()
+            .instance()
+            .get(&StorageKey::Admin)
+            .unwrap_or_else(|| placeholder_admin(&env));
+        let is_paused = admin::is_paused(&env, String::from_str(&env, CAT_ALL));
+        HealthStatus {
+            is_initialized: true,
+            is_paused,
+            version,
+            admin,
+        }
+    }
+
+    /// # Summary
+    /// Set price for an asset pair. Stores the price, updates history,
+    /// and triggers staleness metadata update.
+    ///
+    /// # Parameters
+    /// - `env`: Soroban environment.
+    /// - `pair`: The asset pair to price.
+    /// - `price`: Price value (must be > 0).
+    ///
+    /// # Returns
+    /// `Ok(())` on success.
+    ///
+    /// # Errors
+    /// - [`OracleError::CircuitBreakerTripped`] — oracle is paused.
+    /// - [`OracleError::InvalidAsset`] — price <= 0.
     pub fn set_price(env: Env, pair: AssetPair, price: i128) -> Result<(), OracleError> {
+        if admin::is_paused(&env, String::from_str(&env, CAT_ALL)) {
+            return Err(OracleError::CircuitBreakerTripped);
+        }
         if price <= 0 {
             return Err(OracleError::InvalidAsset);
         }
         storage::set_price(&env, &pair, price);
-        storage::add_available_pair(&env, pair);
+        storage::add_available_pair(&env, pair.clone());
+        history::store_price(&env, &pair, price);
+        on_price_update(&env, pair);
         Ok(())
-    }
-
-    /// Get price for an asset pair
-    pub fn get_price(env: Env, pair: AssetPair) -> Result<i128, OracleError> {
-        storage::get_price(&env, &pair)
     }
 
     /// Convert amount to base currency
@@ -69,24 +113,26 @@ impl OracleContract {
         // Check cache first
         let base = storage::get_base_currency(&env);
         if let Some(cached) = storage::get_cached_conversion(&env, &asset, &base) {
-            return Ok(amount.checked_mul(cached.rate)
+            return Ok(amount
+                .checked_mul(cached.rate)
                 .and_then(|v| v.checked_div(10_000_000))
                 .ok_or(OracleError::ConversionOverflow)?);
         }
 
         // Perform conversion
         let result = conversion::convert_to_base(&env, amount, asset.clone())?;
-        
+
         // Cache the rate
         if amount > 0 {
-            let rate = result.checked_mul(10_000_000)
+            let rate = result
+                .checked_mul(10_000_000)
                 .and_then(|v| v.checked_div(amount))
                 .unwrap_or(0);
             if rate > 0 {
                 storage::set_cached_conversion(&env, &asset, &base, rate);
             }
         }
-        
+
         Ok(result)
     }
 
@@ -104,124 +150,116 @@ impl OracleContract {
     pub fn add_pair(env: Env, pair: AssetPair) {
         storage::add_available_pair(&env, pair);
     }
-}
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use soroban_sdk::{testutils::Address as _, String};
-
-    fn xlm(env: &Env) -> Asset {
-        Asset {
-            code: String::from_str(env, "XLM"),
-            issuer: None,
-        }
+    /// Get historical price at timestamp
+    pub fn get_historical_price(env: Env, pair: AssetPair, timestamp: u64) -> Option<i128> {
+        history::get_historical_price(&env, &pair, timestamp)
     }
 
-    fn usdc(env: &Env) -> Asset {
-        Asset {
-            code: String::from_str(env, "USDC"),
-            issuer: Some(Address::generate(env)),
-        }
+    /// Check oracle heartbeat health for a pair using ledger freshness.
+    pub fn check_oracle_heartbeat(env: Env, pair: AssetPair) -> OracleHealth {
+        let health = staleness::check_oracle_heartbeat(&env, &pair);
+        maybe_emit_heartbeat_missed(&env, &pair, &health);
+        health
     }
 
-    fn token(env: &Env, code: &str) -> Asset {
-        Asset {
-            code: String::from_str(env, code),
-            issuer: Some(Address::generate(env)),
-        }
+    /// Get current pause states
+    pub fn get_pause_states(env: Env) -> Map<String, PauseState> {
+        admin::get_pause_states(&env)
     }
 
-    #[test]
-    fn test_initialize_and_get_base() {
-        let env = Env::default();
-        let contract_id = env.register_contract(None, OracleContract);
-        let client = OracleContractClient::new(&env, &contract_id);
-        let admin = Address::generate(&env);
-
-        client.initialize(&admin, &xlm(&env));
-        let base = client.get_base_currency();
-        assert_eq!(base.code, String::from_str(&env, "XLM"));
+    /// Pause a category (admin or guardian)
+    pub fn pause_category(
+        env: Env,
+        caller: Address,
+        category: String,
+        duration: Option<u64>,
+        reason: String,
+    ) -> Result<(), OracleError> {
+        admin::pause_category(&env, &caller, category, duration, reason)
     }
 
-    #[test]
-    fn test_set_and_get_price() {
-        let env = Env::default();
-        let contract_id = env.register_contract(None, OracleContract);
-        let client = OracleContractClient::new(&env, &contract_id);
-
-        let pair = AssetPair {
-            base: usdc(&env),
-            quote: xlm(&env),
-        };
-        
-        client.set_price(&pair, &10_000_000); // 1 USDC = 1 XLM
-        let price = client.get_price(&pair).unwrap();
-        assert_eq!(price, 10_000_000);
+    /// Unpause a category (admin only)
+    pub fn unpause_category(
+        env: Env,
+        caller: Address,
+        category: String,
+    ) -> Result<(), OracleError> {
+        admin::unpause_category(&env, &caller, category)
     }
 
-    #[test]
-    fn test_convert_to_base_direct() {
-        let env = Env::default();
-        let contract_id = env.register_contract(None, OracleContract);
-        let client = OracleContractClient::new(&env, &contract_id);
-        let admin = Address::generate(&env);
-
-        let xlm = xlm(&env);
-        let usdc = usdc(&env);
-
-        client.initialize(&admin, &xlm);
-
-        // Set price: 1 USDC = 10 XLM
-        let pair = AssetPair {
-            base: usdc.clone(),
-            quote: xlm.clone(),
-        };
-        client.set_price(&pair, &100_000_000); // 10 XLM per USDC
-
-        // Convert 100 USDC to XLM
-        let result = client.convert_to_base(&100_0000000, &usdc).unwrap();
-        assert_eq!(result, 1000_0000000); // 1000 XLM
+    /// Set guardian address (admin only)
+    pub fn set_guardian(env: Env, caller: Address, guardian: Address) -> Result<(), OracleError> {
+        admin::set_guardian(&env, &caller, guardian)
     }
 
-    #[test]
-    fn test_convert_same_asset() {
-        let env = Env::default();
-        let contract_id = env.register_contract(None, OracleContract);
-        let client = OracleContractClient::new(&env, &contract_id);
-        let admin = Address::generate(&env);
-
-        let xlm = xlm(&env);
-        client.initialize(&admin, &xlm);
-
-        let result = client.convert_to_base(&1000_0000000, &xlm).unwrap();
-        assert_eq!(result, 1000_0000000);
+    /// Revoke guardian (admin only)
+    pub fn revoke_guardian(env: Env, caller: Address) -> Result<(), OracleError> {
+        admin::revoke_guardian(&env, &caller)
     }
 
-    #[test]
-    fn test_base_currency_change() {
-        let env = Env::default();
-        let contract_id = env.register_contract(None, OracleContract);
-        let client = OracleContractClient::new(&env, &contract_id);
-        let admin = Address::generate(&env);
-
-        let xlm = xlm(&env);
-        let usdc = usdc(&env);
-
-        client.initialize(&admin, &xlm);
-        assert_eq!(client.get_base_currency().code, String::from_str(&env, "XLM"));
-
-        client.set_base_currency(&usdc);
-        assert_eq!(client.get_base_currency().code, String::from_str(&env, "USDC"));
+    /// Get current guardian, if any.
+    pub fn get_guardian(env: Env) -> Option<Address> {
+        admin::get_guardian(&env)
     }
-}
-=======
-    /// Initialize the contract with an admin
-    pub fn initialize(env: Env, admin: Address) {
-        if env.storage().instance().has(&StorageKey::Admin) {
-            panic!("already initialized");
-        }
-        env.storage().instance().set(&StorageKey::Admin, &admin);
+
+    /// Propose admin transfer (current admin only)
+    pub fn propose_admin_transfer(
+        env: Env,
+        caller: Address,
+        new_admin: Address,
+    ) -> Result<(), OracleError> {
+        admin::propose_admin_transfer(&env, &caller, new_admin)
+    }
+
+    /// Accept admin transfer (new admin only)
+    pub fn accept_admin_transfer(env: Env, caller: Address) -> Result<(), OracleError> {
+        admin::accept_admin_transfer(&env, &caller)
+    }
+
+    /// Cancel pending admin transfer (current admin only)
+    pub fn cancel_admin_transfer(env: Env, caller: Address) -> Result<(), OracleError> {
+        admin::cancel_admin_transfer(&env, &caller)
+    }
+
+    /// Calculate TWAP for 1 hour
+    pub fn get_twap_1h(env: Env, pair: AssetPair) -> Result<i128, OracleError> {
+        history::calculate_twap(&env, &pair, 3600)
+    }
+
+    /// Calculate TWAP for 24 hours
+    pub fn get_twap_24h(env: Env, pair: AssetPair) -> Result<i128, OracleError> {
+        history::calculate_twap(&env, &pair, 86400)
+    }
+
+    /// Calculate TWAP for 7 days
+    pub fn get_twap_7d(env: Env, pair: AssetPair) -> Result<i128, OracleError> {
+        history::calculate_twap(&env, &pair, 604800)
+    }
+
+    /// Get price deviation from TWAP
+    pub fn get_price_deviation(
+        env: Env,
+        pair: AssetPair,
+        current_price: i128,
+        window: u64,
+    ) -> Result<i128, OracleError> {
+        history::get_twap_deviation(&env, &pair, current_price, window)
+    }
+
+    /// Find optimal path between assets
+    pub fn find_optimal_path(
+        env: Env,
+        from: Asset,
+        to: Asset,
+        amount: i128,
+    ) -> Result<LiquidityPath, OracleError> {
+        multi_hop::find_optimal_path(&env, from, to, amount)
+    }
+
+    /// Calculate price via multi-hop path
+    pub fn calculate_multi_hop_price(env: Env, path: LiquidityPath, amount: i128) -> i128 {
+        multi_hop::calculate_multi_hop_price(&env, path, amount)
     }
 
     /// Register a new oracle
@@ -229,7 +267,7 @@ mod tests {
         admin.require_auth();
         Self::require_admin(&env, &admin)?;
 
-        let mut oracles = Self::get_oracles(&env);
+        let mut oracles = Self::read_oracles(&env);
         if oracles.contains(&oracle) {
             return Err(OracleError::OracleAlreadyExists);
         }
@@ -255,13 +293,16 @@ mod tests {
 
     /// Submit a price from an oracle
     pub fn submit_price(env: Env, oracle: Address, price: i128) -> Result<(), OracleError> {
+        if admin::is_paused(&env, String::from_str(&env, CAT_ALL)) {
+            return Err(OracleError::CircuitBreakerTripped);
+        }
         oracle.require_auth();
 
         if price <= 0 {
             return Err(OracleError::InvalidPrice);
         }
 
-        let oracles = Self::get_oracles(&env);
+        let oracles = Self::read_oracles(&env);
         if !oracles.contains(&oracle) {
             return Err(OracleError::OracleNotFound);
         }
@@ -292,7 +333,7 @@ mod tests {
     /// Calculate consensus price and update oracle reputations
     pub fn calculate_consensus(env: Env) -> Result<i128, OracleError> {
         let submissions = Self::get_price_submissions(&env);
-        let oracles = Self::get_oracles(&env);
+        let oracles = Self::read_oracles(&env);
 
         if submissions.is_empty() {
             return Err(OracleError::InsufficientOracles);
@@ -353,7 +394,7 @@ mod tests {
         let consensus_data = ConsensusPriceData {
             price: consensus_price,
             timestamp: env.ledger().timestamp(),
-            num_oracles: submissions.len(),
+            num_oracles: submissions.len() as u32,
         };
         env.storage()
             .persistent()
@@ -375,12 +416,16 @@ mod tests {
         get_oracle_stats(&env, &oracle)
     }
 
-    /// Get all registered oracles
-    pub fn get_oracles(env: &Env) -> Vec<Address> {
+    fn read_oracles(env: &Env) -> Vec<Address> {
         env.storage()
             .persistent()
             .get(&StorageKey::Oracles)
             .unwrap_or(Vec::new(env))
+    }
+
+    /// Get all registered oracles
+    pub fn get_oracles(env: Env) -> Vec<Address> {
+        Self::read_oracles(&env)
     }
 
     /// Get current consensus price
@@ -458,7 +503,7 @@ mod tests {
     }
 
     fn remove_oracle_internal(env: &Env, oracle: &Address) {
-        let oracles = Self::get_oracles(env);
+        let oracles = Self::read_oracles(env);
         let mut new_oracles = Vec::new(env);
 
         for i in 0..oracles.len() {
@@ -472,8 +517,274 @@ mod tests {
             .persistent()
             .set(&StorageKey::Oracles, &new_oracles);
     }
+
+    /// # Summary
+    /// Get the aggregated price for an asset pair. Applies median aggregation
+    /// across all fresh price sources (staleness TTL: 300s).
+    ///
+    /// # Parameters
+    /// - `env`: Soroban environment.
+    /// - `pair`: The asset pair to query.
+    ///
+    /// # Returns
+    /// The median aggregated price.
+    ///
+    /// # Errors
+    /// - [`OracleError::PriceNotFound`] — no price data for this pair.
+    /// - [`OracleError::StalePrice`] — all price sources are stale (> 300s old).
+    /// - [`OracleError::UnreliablePrice`] — sources disagree by > 10%.
+    pub fn get_price(env: Env, pair: AssetPair) -> Result<i128, OracleError> {
+        let (price, _) = Self::get_price_with_confidence(env, pair)?;
+        Ok(price)
+    }
+
+    pub fn get_price_with_confidence(
+        env: Env,
+        pair: AssetPair,
+    ) -> Result<(i128, u32), OracleError> {
+        let key = StorageKey::PriceMap(pair.clone());
+        let prices: Vec<PriceData> = env
+            .storage()
+            .temporary()
+            .get(&key)
+            .ok_or(OracleError::PriceNotFound)?;
+
+        let current_time = env.ledger().timestamp();
+        let mut fresh_prices: Vec<PriceData> = Vec::new(&env);
+
+        // 1. Filter stale prices (TTL: 300s / 5 mins)
+        for p in prices.iter() {
+            if current_time.saturating_sub(p.timestamp) < 300 {
+                fresh_prices.push_back(p);
+            }
+        }
+
+        if fresh_prices.is_empty() {
+            return Err(OracleError::StalePrice);
+        }
+
+        // 1b. Enforce minimum independent source count
+        let min_count: u32 = env
+            .storage()
+            .instance()
+            .get(&StorageKey::MinSourceCount)
+            .unwrap_or(0);
+        if min_count > 0 && (fresh_prices.len() as u32) < min_count {
+            return Err(OracleError::InsufficientSources);
+        }
+
+        // 2. Median Aggregation
+        // Sort by price
+        let mut sorted = fresh_prices;
+        let len = sorted.len();
+        for i in 0..len {
+            for j in 0..(len - i - 1) {
+                if sorted.get(j).unwrap().price > sorted.get(j + 1).unwrap().price {
+                    let temp = sorted.get(j).unwrap();
+                    sorted.set(j, sorted.get(j + 1).unwrap());
+                    sorted.set(j + 1, temp);
+                }
+            }
+        }
+
+        let median_data = sorted.get(len / 2).unwrap();
+
+        // 3. Check for 10% deviation (Edge Case)
+        let min_p = sorted.get(0).unwrap().price;
+        let max_p = sorted.get(len - 1).unwrap().price;
+        if (max_p - min_p) * 100 / min_p > 10 {
+            // Price sources disagree by > 10%
+            return Err(OracleError::UnreliablePrice);
+        }
+
+        Ok((median_data.price, median_data.confidence))
+    }
+
+    /// Set the minimum number of independent fresh sources required before a
+    /// price is considered valid for risk-sensitive operations.
+    /// Admin only. Emits `min_src_count_updated`.
+    pub fn set_min_source_count(
+        env: Env,
+        admin: Address,
+        min_count: u32,
+    ) -> Result<(), OracleError> {
+        admin.require_auth();
+        Self::require_admin(&env, &admin)?;
+        let old: u32 = env
+            .storage()
+            .instance()
+            .get(&StorageKey::MinSourceCount)
+            .unwrap_or(0);
+        env.storage()
+            .instance()
+            .set(&StorageKey::MinSourceCount, &min_count);
+        events::emit_min_source_count_updated(&env, old, min_count);
+        Ok(())
+    }
+
+    /// Return the current minimum independent source count (0 = no requirement).
+    pub fn get_min_source_count(env: Env) -> u32 {
+        env.storage()
+            .instance()
+            .get(&StorageKey::MinSourceCount)
+            .unwrap_or(0)
+    }
+
+    pub fn add_price_source(
+        env: Env,
+        admin: Address,
+        source: Address,
+        weight: u32,
+    ) -> Result<(), OracleError> {
+        admin.require_auth();
+        Self::require_admin(&env, &admin)?;
+
+        env.storage()
+            .persistent()
+            .set(&StorageKey::OracleWeight(source), &weight);
+        Ok(())
+    }
+
+    /// Submit a price observation for aggregation (`PriceMap` path).
+    pub fn submit_pair_price(
+        env: Env,
+        source: Address,
+        pair: AssetPair,
+        price: i128,
+        confidence: u32,
+    ) -> Result<(), OracleError> {
+        if admin::is_paused(&env, String::from_str(&env, CAT_ALL)) {
+            return Err(OracleError::CircuitBreakerTripped);
+        }
+
+        source.require_auth();
+
+        // Ensure source is a registered oracle
+        let weight: u32 = env
+            .storage()
+            .persistent()
+            .get(&StorageKey::OracleWeight(source.clone()))
+            .unwrap_or(0);
+        if weight == 0 {
+            return Err(OracleError::Unauthorized);
+        }
+
+        let key = StorageKey::PriceMap(pair.clone());
+        let mut prices: Vec<PriceData> = env
+            .storage()
+            .temporary()
+            .get(&key)
+            .unwrap_or(Vec::new(&env));
+
+        let new_entry = PriceData {
+            asset_pair: pair,
+            price,
+            timestamp: env.ledger().timestamp(),
+            source,
+            confidence,
+        };
+
+        prices.push_back(new_entry);
+
+        // Cache management: Keep prices for 5 mins
+        env.storage().temporary().set(&key, &prices);
+        env.storage().temporary().extend_ttl(&key, 60, 60);
+
+        Ok(())
+    }
+
+    pub fn refresh_from_sdex(env: Env, pair: AssetPair) -> Result<i128, OracleError> {
+        // 1. In a real Soroban scenario, you would interface with the
+        // Liquidity Pool or a specialized SDEX oracle contract.
+        // For this issue, we assume we fetch the orderbook.
+        let orderbook = fetch_sdex_orderbook(&env, &pair)?;
+
+        // 2. Calculate price
+        let price = calculate_spot_price(&env, orderbook)?;
+
+        Ok(price)
+    }
+
+    pub fn update_with_external_data(
+        env: Env,
+        prices: Vec<ExternalPrice>,
+    ) -> Result<i128, OracleError> {
+        let first_pair = prices.get(0).map(|p| p.asset_pair.clone());
+        let consensus_price = crate::external_adapter::process_external_prices(&env, prices)?;
+        if let Some(pair) = first_pair {
+            storage::set_price(&env, &pair, consensus_price);
+            on_price_update(&env, pair);
+        }
+
+        Ok(consensus_price)
+    }
+}
+
+// Internal helper to represent the SDEX query
+fn fetch_sdex_orderbook(env: &Env, pair: &AssetPair) -> Result<OrderBook, OracleError> {
+    // Note: Actual Soroban host functions for SDEX are currently limited
+    // to Liquidity Pool swaps. For Order Books, one typically uses
+    // a Cross-Chain/Bridge approach or a Trusted Observer.
+    // Here we implement the interface logic.
+    unimplemented!("SDEX Orderbook Host Interface");
+}
+
+pub fn get_safe_price(env: Env, pair: AssetPair) -> Result<i128, OracleError> {
+    let level = staleness::check_staleness(&env, pair.clone());
+
+    if level == StalenessLevel::Critical {
+        return Err(OracleError::CircuitBreakerTripped);
+    }
+
+    if level == StalenessLevel::Stale {
+        return Err(OracleError::PriceStaleTradeBlocked);
+    }
+
+    storage::get_price(&env, &pair)
+}
+
+pub fn on_price_update(env: &Env, pair: AssetPair) {
+    let mut metadata = staleness::get_metadata(env, &pair);
+
+    // Auto-recovery
+    if metadata.is_paused {
+        metadata.is_paused = false;
+        env.events().publish(
+            (symbol_short!("RECOVER"), pair.clone()),
+            env.ledger().timestamp(),
+        );
+    }
+
+    metadata.last_update = env.ledger().timestamp();
+    metadata.last_update_ledger = env.ledger().sequence();
+    metadata.update_count_24h += 1;
+    metadata.last_heartbeat_status = OracleStatus::Healthy;
+    staleness::set_metadata(env, &pair, metadata);
+}
+
+fn maybe_emit_heartbeat_missed(env: &Env, pair: &AssetPair, health: &OracleHealth) {
+    if health.status == OracleStatus::Healthy {
+        return;
+    }
+
+    let mut metadata = staleness::get_metadata(env, pair);
+    if metadata.last_heartbeat_status != health.status {
+        events::emit_oracle_heartbeat_missed(
+            env,
+            health.status.clone(),
+            health.last_update_ledger,
+            health.ledgers_since_update,
+        );
+        metadata.last_heartbeat_status = health.status.clone();
+        staleness::set_metadata(env, pair, metadata);
+    }
 }
 
 #[cfg(test)]
 mod test;
- main
+
+#[cfg(test)]
+mod test_health;
+
+#[cfg(test)]
+mod test_admin_transfer;

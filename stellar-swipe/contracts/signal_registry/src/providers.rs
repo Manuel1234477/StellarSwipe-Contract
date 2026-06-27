@@ -1,0 +1,660 @@
+use soroban_sdk::{contracttype, Address, Bytes, Env, IntoVal, Map, String, Symbol, Val, Vec};
+
+use crate::events;
+use crate::types::{ProviderPerformance, Signal, SignalStatus};
+
+/// Storage key for the banned providers map
+#[contracttype]
+#[derive(Clone)]
+pub enum BanStorageKey {
+    /// (provider) -> reason_hash; presence of key indicates banned status
+    ProviderBanReason(Address),
+}
+
+pub const GOLD_TIER_STAKE: i128 = 1_000_000_000;
+pub const MIN_CLOSED_SIGNALS: u32 = 20;
+pub const MIN_SUCCESS_RATE_BPS: u32 = 6_000;
+
+// ─── Provider Profile (Task 3) ────────────────────────────────────────────────
+
+/// On-chain provider profile. Content (display name, bio) is stored off-chain;
+/// only their hashes are stored here.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProviderProfile {
+    /// Hash of the provider's display name (off-chain content).
+    pub display_name_hash: String,
+    /// Hash of the provider's bio (off-chain content).
+    pub bio_hash: String,
+    /// Ledger timestamp when the profile was created.
+    pub created_at: u64,
+    /// Total signals submitted (mirrored from ProviderPerformance for quick reads).
+    pub total_signals: u32,
+    /// Success rate in basis points (0–10_000).
+    pub success_rate: u32,
+    /// Reputation score (0–100).
+    pub reputation_score: u32,
+    /// Stake tier: 0 = none, 1 = bronze, 2 = silver, 3 = gold.
+    pub stake_tier: u32,
+    /// Whether the provider has passed verification.
+    pub verified: bool,
+}
+
+/// Storage key for provider profiles.
+#[contracttype]
+#[derive(Clone)]
+pub enum ProviderStorageKey {
+    Profile(Address),
+    BanAppeal(Address),
+}
+
+/// Create or update a provider profile.
+///
+/// - On first call (no existing profile): creates a new profile with `created_at = now`.
+/// - On subsequent calls: updates `display_name_hash` and `bio_hash` only.
+/// - `total_signals`, `success_rate`, `reputation_score`, `stake_tier`, and `verified`
+///   are derived from `stats` and `stake` on every call so the profile stays in sync.
+pub fn create_or_update_provider_profile(
+    env: &Env,
+    provider: Address,
+    display_name_hash: String,
+    bio_hash: String,
+    stats: &ProviderPerformance,
+    stake: i128,
+    verified: bool,
+) -> ProviderProfile {
+    let key = ProviderStorageKey::Profile(provider.clone());
+
+    let created_at = env
+        .storage()
+        .persistent()
+        .get::<_, ProviderProfile>(&key)
+        .map(|p| p.created_at)
+        .unwrap_or_else(|| env.ledger().timestamp());
+
+    let stake_tier = if stake >= GOLD_TIER_STAKE {
+        3
+    } else if stake >= GOLD_TIER_STAKE / 2 {
+        2
+    } else if stake >= GOLD_TIER_STAKE / 10 {
+        1
+    } else {
+        0
+    };
+
+    let profile = ProviderProfile {
+        display_name_hash,
+        bio_hash,
+        created_at,
+        total_signals: stats.total_signals,
+        success_rate: stats.success_rate,
+        reputation_score: (stats.success_rate / 100).min(100),
+        stake_tier,
+        verified,
+    };
+
+    env.storage().persistent().set(&key, &profile);
+
+    let topics = (Symbol::new(env, "provider_profile_updated"),);
+    env.events().publish(topics, provider);
+
+    profile
+}
+
+/// Read a provider profile. Returns `None` if no profile exists.
+pub fn get_provider_profile(env: &Env, provider: &Address) -> Option<ProviderProfile> {
+    env.storage()
+        .persistent()
+        .get(&ProviderStorageKey::Profile(provider.clone()))
+}
+
+// ─── Provider Appeal Mechanism (Task 4) ──────────────────────────────────────
+
+/// Status of a ban appeal.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum AppealStatus {
+    Pending,
+    Approved,
+    Rejected,
+}
+
+/// On-chain ban appeal record.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BanAppeal {
+    pub provider: Address,
+    /// IPFS hash (or similar) of the evidence document.
+    pub evidence_hash: Bytes,
+    /// Governance proposal ID created for this appeal.
+    pub governance_proposal_id: u64,
+    /// Current status of the appeal.
+    pub status: AppealStatus,
+    /// Ledger timestamp when the appeal was submitted.
+    pub submitted_at: u64,
+}
+
+/// Submit a ban appeal for `provider`.
+///
+/// Creates a governance proposal (via `create_governance_proposal_fn`) and stores
+/// the appeal record. Emits `BanAppealSubmitted`.
+///
+/// `create_governance_proposal_fn` is injected so this module stays decoupled from
+/// the governance contract. In production, pass a closure that calls the governance
+/// contract; in tests, pass a stub.
+pub fn submit_ban_appeal<F>(
+    env: &Env,
+    provider: Address,
+    evidence_hash: Bytes,
+    create_governance_proposal_fn: F,
+) -> Result<BanAppeal, AppealError>
+where
+    F: Fn(&Env, &Address, &Bytes) -> Result<u64, AppealError>,
+{
+    // Prevent duplicate pending appeals.
+    let key = ProviderStorageKey::BanAppeal(provider.clone());
+    if let Some(existing) = env.storage().persistent().get::<_, BanAppeal>(&key) {
+        if existing.status == AppealStatus::Pending {
+            return Err(AppealError::AppealAlreadyPending);
+        }
+    }
+
+    let proposal_id = create_governance_proposal_fn(env, &provider, &evidence_hash)?;
+
+    let appeal = BanAppeal {
+        provider: provider.clone(),
+        evidence_hash,
+        governance_proposal_id: proposal_id,
+        status: AppealStatus::Pending,
+        submitted_at: env.ledger().timestamp(),
+    };
+
+    env.storage().persistent().set(&key, &appeal);
+
+    let topics = (Symbol::new(env, "ban_appeal_submitted"),);
+    env.events().publish(topics, (provider, proposal_id));
+
+    Ok(appeal)
+}
+
+/// Governance calls this to reverse a ban (approve the appeal).
+///
+/// Restores the provider's `verified` flag in their profile and emits `BanReversed`.
+/// `return_stake_fn` is injected to handle stake return logic.
+pub fn reverse_ban<F>(env: &Env, provider: Address, return_stake_fn: F) -> Result<(), AppealError>
+where
+    F: Fn(&Env, &Address) -> Result<(), AppealError>,
+{
+    let key = ProviderStorageKey::BanAppeal(provider.clone());
+    let mut appeal: BanAppeal = env
+        .storage()
+        .persistent()
+        .get(&key)
+        .ok_or(AppealError::AppealNotFound)?;
+
+    if appeal.status != AppealStatus::Pending {
+        return Err(AppealError::AppealAlreadyResolved);
+    }
+
+    appeal.status = AppealStatus::Approved;
+    env.storage().persistent().set(&key, &appeal);
+
+    // Restore verified flag in profile if it exists.
+    let profile_key = ProviderStorageKey::Profile(provider.clone());
+    if let Some(mut profile) = env
+        .storage()
+        .persistent()
+        .get::<_, ProviderProfile>(&profile_key)
+    {
+        profile.verified = true;
+        env.storage().persistent().set(&profile_key, &profile);
+    }
+
+    return_stake_fn(env, &provider)?;
+
+    let topics = (Symbol::new(env, "ban_reversed"),);
+    env.events().publish(topics, provider);
+
+    Ok(())
+}
+
+/// Governance calls this to reject an appeal.
+pub fn reject_ban_appeal(env: &Env, provider: Address) -> Result<(), AppealError> {
+    let key = ProviderStorageKey::BanAppeal(provider.clone());
+    let mut appeal: BanAppeal = env
+        .storage()
+        .persistent()
+        .get(&key)
+        .ok_or(AppealError::AppealNotFound)?;
+
+    if appeal.status != AppealStatus::Pending {
+        return Err(AppealError::AppealAlreadyResolved);
+    }
+
+    appeal.status = AppealStatus::Rejected;
+    env.storage().persistent().set(&key, &appeal);
+
+    let topics = (Symbol::new(env, "ban_appeal_rejected"),);
+    env.events().publish(topics, provider);
+
+    Ok(())
+}
+
+/// Get the current appeal record for a provider.
+pub fn get_ban_appeal(env: &Env, provider: &Address) -> Option<BanAppeal> {
+    env.storage()
+        .persistent()
+        .get(&ProviderStorageKey::BanAppeal(provider.clone()))
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum AppealError {
+    AppealAlreadyPending,
+    AppealNotFound,
+    AppealAlreadyResolved,
+    GovernanceError,
+}
+
+// ─── Verification Eligibility (existing) ─────────────────────────────────────
+
+#[contracttype]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VerificationEligibility {
+    pub eligible: bool,
+    pub stake_ok: bool,
+    pub history_ok: bool,
+    pub success_rate_ok: bool,
+    pub missing_criteria: Vec<String>,
+}
+
+pub fn check_verification_eligibility(
+    env: &Env,
+    provider: Address,
+    stake: i128,
+    stats: ProviderPerformance,
+) -> VerificationEligibility {
+    let stake_ok = stake >= GOLD_TIER_STAKE;
+    let history_ok = stats.total_signals >= MIN_CLOSED_SIGNALS;
+    let success_rate_ok = stats.success_rate >= MIN_SUCCESS_RATE_BPS;
+    let eligible = stake_ok && history_ok && success_rate_ok;
+
+    let mut missing_criteria = Vec::new(env);
+    if !stake_ok {
+        missing_criteria.push_back(String::from_str(env, "gold_tier_stake"));
+    }
+    if !history_ok {
+        missing_criteria.push_back(String::from_str(env, "closed_signals"));
+    }
+    if !success_rate_ok {
+        missing_criteria.push_back(String::from_str(env, "success_rate"));
+    }
+
+    crate::events::emit_verification_eligibility_checked(env, provider, eligible);
+
+    VerificationEligibility {
+        eligible,
+        stake_ok,
+        history_ok,
+        success_rate_ok,
+        missing_criteria,
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// Issue #424: Provider Ban Mechanism
+// ═══════════════════════════════════════════════════════════════════
+
+/// Check if a provider is banned (presence of ban reason indicates banned status)
+pub fn is_provider_banned(env: &Env, provider: &Address) -> bool {
+    env.storage()
+        .persistent()
+        .has(&BanStorageKey::ProviderBanReason(provider.clone()))
+}
+
+/// Get the ban reason hash for a banned provider
+pub fn get_ban_reason(env: &Env, provider: &Address) -> Option<String> {
+    env.storage()
+        .persistent()
+        .get(&BanStorageKey::ProviderBanReason(provider.clone()))
+}
+
+/// Ban a provider: cancel all active signals, slash full stake, block future submissions.
+///
+/// # Arguments
+/// * `env` - Soroban environment
+/// * `signals_map` - Mutable reference to the signals map (signals will be cancelled in-place)
+/// * `provider` - Address of the provider to ban
+/// * `reason_hash` - On-chain evidence hash (e.g. IPFS CID of dispute documentation)
+/// * `stake_vault` - Address of the StakeVault contract for slashing
+///
+/// # Returns
+/// `(signals_cancelled, stake_slashed)` tuple
+pub fn ban_provider(
+    env: &Env,
+    signals_map: &mut Map<u64, Signal>,
+    provider: &Address,
+    reason_hash: &String,
+    stake_vault: &Address,
+) -> (u32, i128) {
+    // Mark provider as banned by storing the reason hash
+    env.storage().persistent().set(
+        &BanStorageKey::ProviderBanReason(provider.clone()),
+        reason_hash,
+    );
+
+    // Cancel all active signals from this provider
+    let mut signals_cancelled: u32 = 0;
+    for i in 0..signals_map.keys().len() {
+        if let Some(key) = signals_map.keys().get(i) {
+            if let Some(mut signal) = signals_map.get(key) {
+                if signal.provider == *provider && signal.status == SignalStatus::Active {
+                    signal.status = SignalStatus::Failed;
+                    signals_map.set(key, signal);
+                    signals_cancelled += 1;
+                }
+            }
+        }
+    }
+
+    // Slash full stake via cross-contract call to StakeVault
+    let stake_slashed = slash_stake(env, provider, stake_vault);
+
+    (signals_cancelled, stake_slashed)
+}
+
+/// Slash the full stake of a provider via StakeVault cross-contract call
+fn slash_stake(env: &Env, provider: &Address, stake_vault: &Address) -> i128 {
+    let sym = soroban_sdk::Symbol::new(env, "get_stake");
+    let mut args = soroban_sdk::Vec::<soroban_sdk::Val>::new(env);
+    args.push_back(provider.clone().into_val(env));
+    let stake: i128 = env.invoke_contract(stake_vault, &sym, args);
+
+    if stake > 0 {
+        // Call slash_stake on StakeVault — pass this contract as caller (authorizes the slash),
+        // the provider, the full stake amount, and a reason tag for the audit event.
+        let slash_sym = soroban_sdk::Symbol::new(env, "slash_stake");
+        let mut slash_args = soroban_sdk::Vec::<soroban_sdk::Val>::new(env);
+        let caller = env.current_contract_address();
+        slash_args.push_back(caller.into_val(env));
+        slash_args.push_back(provider.clone().into_val(env));
+        slash_args.push_back(stake.into_val(env));
+        let reason = soroban_sdk::Symbol::new(env, "ban");
+        slash_args.push_back(reason.into_val(env));
+        let _ = env.invoke_contract::<()>(stake_vault, &slash_sym, slash_args);
+    }
+
+    stake
+}
+
+/// Emit the ProviderBanned event
+pub fn emit_provider_banned(
+    env: &Env,
+    provider: &Address,
+    reason_hash: &String,
+    signals_cancelled: u32,
+    stake_slashed: i128,
+) {
+    let topics = (
+        soroban_sdk::Symbol::new(env, "provider_banned"),
+        provider.clone(),
+    );
+    env.events().publish(
+        topics,
+        (reason_hash.clone(), signals_cancelled, stake_slashed),
+    );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use soroban_sdk::testutils::Address as _;
+    use soroban_sdk::Bytes;
+
+    fn stats(total_signals: u32, success_rate: u32) -> ProviderPerformance {
+        ProviderPerformance {
+            total_signals,
+            successful_signals: 0,
+            failed_signals: 0,
+            total_copies: 0,
+            success_rate,
+            avg_return: 0,
+            total_volume: 0,
+            follower_count: 0,
+        }
+    }
+
+    // ── Profile tests ──────────────────────────────────────────────────────
+
+    fn with_contract<R>(f: impl FnOnce(&Env) -> R) -> R {
+        let env = Env::default();
+        #[allow(deprecated)]
+        let cid = env.register_contract(None, crate::SignalRegistry);
+        env.as_contract(&cid, || f(&env))
+    }
+
+    #[test]
+    fn profile_created_on_first_stake() {
+        with_contract(|env| {
+            let provider = Address::generate(&env);
+            let s = stats(25, 7_000);
+
+            let profile = create_or_update_provider_profile(
+                &env,
+                provider.clone(),
+                String::from_str(&env, "abc123"),
+                String::from_str(&env, "bio456"),
+                &s,
+                GOLD_TIER_STAKE,
+                false,
+            );
+
+            assert_eq!(profile.total_signals, 25);
+            assert_eq!(profile.stake_tier, 3);
+            assert!(!profile.verified);
+
+            let stored = get_provider_profile(&env, &provider).unwrap();
+            assert_eq!(stored.display_name_hash, String::from_str(&env, "abc123"));
+        });
+    }
+
+    #[test]
+    fn profile_update_preserves_created_at() {
+        with_contract(|env| {
+            let provider = Address::generate(&env);
+            let s = stats(10, 5_000);
+
+            let first = create_or_update_provider_profile(
+                &env,
+                provider.clone(),
+                String::from_str(&env, "hash1"),
+                String::from_str(&env, "bio1"),
+                &s,
+                0,
+                false,
+            );
+
+            let second = create_or_update_provider_profile(
+                &env,
+                provider.clone(),
+                String::from_str(&env, "hash2"),
+                String::from_str(&env, "bio2"),
+                &s,
+                0,
+                true,
+            );
+
+            assert_eq!(first.created_at, second.created_at);
+            assert_eq!(second.display_name_hash, String::from_str(&env, "hash2"));
+            assert!(second.verified);
+        });
+    }
+
+    #[test]
+    fn profile_readable_by_anyone() {
+        with_contract(|env| {
+            let provider = Address::generate(&env);
+            let s = stats(5, 4_000);
+
+            create_or_update_provider_profile(
+                &env,
+                provider.clone(),
+                String::from_str(&env, "h"),
+                String::from_str(&env, "b"),
+                &s,
+                0,
+                false,
+            );
+
+            // Any address can read
+            let reader = Address::generate(&env);
+            let _ = reader;
+            assert!(get_provider_profile(&env, &provider).is_some());
+        });
+    }
+
+    // ── Appeal tests ───────────────────────────────────────────────────────
+
+    fn stub_create_proposal(
+        _env: &Env,
+        _provider: &Address,
+        _evidence: &Bytes,
+    ) -> Result<u64, AppealError> {
+        Ok(42) // fake proposal id
+    }
+
+    fn stub_return_stake(_env: &Env, _provider: &Address) -> Result<(), AppealError> {
+        Ok(())
+    }
+
+    #[test]
+    fn appeal_submission_creates_governance_proposal() {
+        with_contract(|env| {
+            let provider = Address::generate(&env);
+            let evidence = Bytes::from_slice(&env, b"ipfs://evidence");
+
+            let appeal =
+                submit_ban_appeal(&env, provider.clone(), evidence, stub_create_proposal).unwrap();
+
+            assert_eq!(appeal.governance_proposal_id, 42);
+            assert_eq!(appeal.status, AppealStatus::Pending);
+
+            let stored = get_ban_appeal(&env, &provider).unwrap();
+            assert_eq!(stored.governance_proposal_id, 42);
+        });
+    }
+
+    #[test]
+    fn governance_reversal_restores_provider_status_and_stake() {
+        with_contract(|env| {
+            let provider = Address::generate(&env);
+            let evidence = Bytes::from_slice(&env, b"ipfs://evidence");
+
+            // Create profile first
+            let s = stats(25, 7_000);
+            create_or_update_provider_profile(
+                &env,
+                provider.clone(),
+                String::from_str(&env, "h"),
+                String::from_str(&env, "b"),
+                &s,
+                GOLD_TIER_STAKE,
+                false, // banned → verified=false
+            );
+
+            submit_ban_appeal(&env, provider.clone(), evidence, stub_create_proposal).unwrap();
+            reverse_ban(&env, provider.clone(), stub_return_stake).unwrap();
+
+            let appeal = get_ban_appeal(&env, &provider).unwrap();
+            assert_eq!(appeal.status, AppealStatus::Approved);
+
+            let profile = get_provider_profile(&env, &provider).unwrap();
+            assert!(profile.verified);
+        });
+    }
+
+    #[test]
+    fn governance_rejection_sets_rejected_status() {
+        with_contract(|env| {
+            let provider = Address::generate(&env);
+            let evidence = Bytes::from_slice(&env, b"ipfs://evidence");
+
+            submit_ban_appeal(&env, provider.clone(), evidence, stub_create_proposal).unwrap();
+            reject_ban_appeal(&env, provider.clone()).unwrap();
+
+            let appeal = get_ban_appeal(&env, &provider).unwrap();
+            assert_eq!(appeal.status, AppealStatus::Rejected);
+        });
+    }
+
+    #[test]
+    fn duplicate_pending_appeal_rejected() {
+        with_contract(|env| {
+            let provider = Address::generate(&env);
+            let evidence = Bytes::from_slice(&env, b"ipfs://evidence");
+
+            submit_ban_appeal(
+                &env,
+                provider.clone(),
+                evidence.clone(),
+                stub_create_proposal,
+            )
+            .unwrap();
+            let result = submit_ban_appeal(&env, provider.clone(), evidence, stub_create_proposal);
+            assert_eq!(result, Err(AppealError::AppealAlreadyPending));
+        });
+    }
+
+    // ── Existing eligibility tests ─────────────────────────────────────────
+
+    #[test]
+    fn fully_eligible_provider_passes() {
+        let env = Env::default();
+        let provider = Address::generate(&env);
+
+        let eligibility = check_verification_eligibility(
+            &env,
+            provider,
+            GOLD_TIER_STAKE,
+            stats(MIN_CLOSED_SIGNALS, MIN_SUCCESS_RATE_BPS),
+        );
+
+        assert!(eligibility.eligible);
+        assert!(eligibility.stake_ok);
+        assert!(eligibility.history_ok);
+        assert!(eligibility.success_rate_ok);
+        assert_eq!(eligibility.missing_criteria.len(), 0);
+    }
+
+    #[test]
+    fn partially_eligible_provider_reports_missing_criteria() {
+        let env = Env::default();
+        let provider = Address::generate(&env);
+
+        let eligibility = check_verification_eligibility(
+            &env,
+            provider,
+            GOLD_TIER_STAKE,
+            stats(MIN_CLOSED_SIGNALS - 1, MIN_SUCCESS_RATE_BPS),
+        );
+
+        assert!(!eligibility.eligible);
+        assert!(eligibility.stake_ok);
+        assert!(!eligibility.history_ok);
+        assert!(eligibility.success_rate_ok);
+        assert_eq!(eligibility.missing_criteria.len(), 1);
+    }
+
+    #[test]
+    fn not_eligible_provider_reports_all_missing_criteria() {
+        let env = Env::default();
+        let provider = Address::generate(&env);
+
+        let eligibility = check_verification_eligibility(&env, provider, 0, stats(0, 0));
+
+        assert!(!eligibility.eligible);
+        assert!(!eligibility.stake_ok);
+        assert!(!eligibility.history_ok);
+        assert!(!eligibility.success_rate_ok);
+        assert_eq!(eligibility.missing_criteria.len(), 3);
+    }
+}

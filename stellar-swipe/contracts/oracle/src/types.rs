@@ -1,4 +1,5 @@
-use soroban_sdk::{contracttype, Address};
+use soroban_sdk::{contracttype, Address, Bytes};
+use stellar_swipe_common::AssetPair;
 
 #[contracttype]
 #[derive(Clone, Debug)]
@@ -20,13 +21,30 @@ pub struct PriceSubmission {
 }
 
 #[contracttype]
+#[derive(Clone, Debug)]
+pub struct PriceData {
+    pub asset_pair: AssetPair,
+    pub price: i128,
+    pub timestamp: u64,
+    pub source: Address,
+    pub confidence: u32,
+}
+
+#[contracttype]
 #[derive(Clone)]
 pub enum StorageKey {
     Admin,
+    Guardian,
+    PriceMap(AssetPair),
     OracleStats,
     Oracles,
     PriceSubmissions,
     ConsensusPrice,
+    PauseStates,
+    OracleWeight(Address),
+    PendingAdmin,
+    PendingAdminExpiry,
+    MinSourceCount,
 }
 
 #[contracttype]
@@ -35,4 +53,15 @@ pub struct ConsensusPriceData {
     pub price: i128,
     pub timestamp: u64,
     pub num_oracles: u32,
+}
+
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct ExternalPrice {
+    pub asset_pair: AssetPair,
+    pub price: i128,
+    pub timestamp: u64,
+    pub round_id: u64,
+    pub signature: Bytes,
+    pub oracle_address: Address,
 }
