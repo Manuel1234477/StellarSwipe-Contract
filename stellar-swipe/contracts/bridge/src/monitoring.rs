@@ -81,6 +81,18 @@ pub struct BridgeTransfer {
     pub validator_signatures: Vec<String>,
     pub created_at: u64,
     pub completed_at: Option<u64>,
+    /// Ledger timestamp of the most recent status transition.
+    pub status_updated_at: u64,
+}
+
+/// Lightweight status record returned by `get_transfer_status`.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TransferStatusInfo {
+    pub transfer_id: u64,
+    pub status: TransferStatus,
+    /// Timestamp of the last status change (ledger time).
+    pub last_status_change: u64,
 }
 
 /// Transfer status tracking
@@ -389,6 +401,7 @@ pub fn handle_reorg(env: &Env, transfer_id: u64) -> Result<(), String> {
     // Reset transfer status if it exists
     if let Some(mut transfer) = get_bridge_transfer(env, transfer_id) {
         transfer.status = TransferStatus::Pending;
+        transfer.status_updated_at = env.ledger().timestamp();
         transfer.validator_signatures = Vec::new(env);
         store_bridge_transfer(env, &transfer);
 
@@ -439,7 +452,9 @@ pub fn mark_transaction_failed(env: &Env, transfer_id: u64) -> Result<(), String
 
     // Update transfer status
     if let Some(mut transfer) = get_bridge_transfer(env, transfer_id) {
+        let now = env.ledger().timestamp();
         transfer.status = TransferStatus::Failed;
+        transfer.status_updated_at = now;
         store_bridge_transfer(env, &transfer);
     }
 
@@ -460,6 +475,17 @@ pub fn get_bridge_transfer(env: &Env, transfer_id: u64) -> Option<BridgeTransfer
     env.storage()
         .persistent()
         .get(&MonitoringDataKey::BridgeTransfer(transfer_id))
+}
+
+/// Read-only: return the current status and timestamp of the last status change
+/// for a bridge transfer.  Returns `None` if the transfer does not exist.
+pub fn get_transfer_status(env: &Env, transfer_id: u64) -> Option<TransferStatusInfo> {
+    let transfer = get_bridge_transfer(env, transfer_id)?;
+    Some(TransferStatusInfo {
+        transfer_id,
+        status: transfer.status,
+        last_status_change: transfer.status_updated_at,
+    })
 }
 
 /// Store bridge transfer
@@ -485,6 +511,7 @@ pub fn create_bridge_transfer(
         return Err(String::from_str(env, "Invalid amount"));
     }
 
+    let now = env.ledger().timestamp();
     let transfer = BridgeTransfer {
         transfer_id,
         bridge_id,
@@ -496,8 +523,9 @@ pub fn create_bridge_transfer(
         user,
         status: TransferStatus::Pending,
         validator_signatures: Vec::new(env),
-        created_at: env.ledger().timestamp(),
+        created_at: now,
         completed_at: None,
+        status_updated_at: now,
     };
 
     store_bridge_transfer(env, &transfer);
@@ -534,6 +562,7 @@ pub fn add_validator_signature(
     // Update transfer status when enough signatures received
     if transfer.validator_signatures.len() >= 2 {
         transfer.status = TransferStatus::ValidatorApproved;
+        transfer.status_updated_at = env.ledger().timestamp();
     }
 
     store_bridge_transfer(env, &transfer);
@@ -568,6 +597,7 @@ pub fn approve_transfer_for_minting(env: &Env, transfer_id: u64) -> Result<(), S
     }
 
     transfer.status = TransferStatus::Minting;
+    transfer.status_updated_at = env.ledger().timestamp();
     store_bridge_transfer(env, &transfer);
 
     env.events().publish(
@@ -583,8 +613,10 @@ pub fn complete_transfer(env: &Env, transfer_id: u64) -> Result<(), String> {
     let mut transfer = get_bridge_transfer(env, transfer_id)
         .ok_or_else(|| String::from_str(env, "Transfer not found"))?;
 
+    let now = env.ledger().timestamp();
     transfer.status = TransferStatus::Complete;
-    transfer.completed_at = Some(env.ledger().timestamp());
+    transfer.completed_at = Some(now);
+    transfer.status_updated_at = now;
     store_bridge_transfer(env, &transfer);
 
     // Update bridge analytics
@@ -979,6 +1011,109 @@ mod tests {
 
         let retrieved = get_chain_finality_config(&env, ChainId::Ethereum).unwrap();
         assert_eq!(retrieved.required_confirmations, 64);
+    }
+
+    // ── get_transfer_status tests ─────────────────────────────────────────────
+
+    #[test]
+    fn test_get_transfer_status_not_found() {
+        let env = setup_env();
+        let result = get_transfer_status(&env, 999);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_get_transfer_status_pending() {
+        let env = setup_env();
+        let user = String::from_str(&env, "user123");
+        let asset = Asset { code: String::from_str(&env, "XLM"), issuer: None };
+
+        create_bridge_transfer(&env, 1, 1, ChainId::Ethereum, ChainId::Polygon, 1_000_000, 100, asset, user).unwrap();
+
+        let info = get_transfer_status(&env, 1).unwrap();
+        assert_eq!(info.transfer_id, 1);
+        assert_eq!(info.status, TransferStatus::Pending);
+        assert_eq!(info.last_status_change, 1000); // env timestamp
+    }
+
+    #[test]
+    fn test_get_transfer_status_transitions_to_validator_approved() {
+        let env = setup_env();
+        let user = String::from_str(&env, "user123");
+        let asset = Asset { code: String::from_str(&env, "XLM"), issuer: None };
+
+        create_bridge_transfer(&env, 1, 1, ChainId::Ethereum, ChainId::Polygon, 1_000_000, 100, asset, user).unwrap();
+
+        let val1 = Address::generate(&env);
+        let val2 = Address::generate(&env);
+        add_validator_signature(&env, 1, val1, String::from_str(&env, "sig1")).unwrap();
+        add_validator_signature(&env, 1, val2, String::from_str(&env, "sig2")).unwrap();
+
+        let info = get_transfer_status(&env, 1).unwrap();
+        assert_eq!(info.status, TransferStatus::ValidatorApproved);
+        assert!(info.last_status_change >= 1000);
+    }
+
+    #[test]
+    fn test_get_transfer_status_transitions_to_complete() {
+        let env = setup_env();
+        let user = String::from_str(&env, "user123");
+        let asset = Asset { code: String::from_str(&env, "XLM"), issuer: None };
+
+        create_bridge_transfer(&env, 1, 1, ChainId::Ethereum, ChainId::Polygon, 1_000_000, 100, asset, user).unwrap();
+
+        complete_transfer(&env, 1).unwrap();
+
+        let info = get_transfer_status(&env, 1).unwrap();
+        assert_eq!(info.status, TransferStatus::Complete);
+    }
+
+    #[test]
+    fn test_get_transfer_status_transitions_to_failed() {
+        let env = setup_env();
+        let tx_hash = String::from_str(&env, "0xabcd1234");
+        let user = String::from_str(&env, "user123");
+        let asset = Asset { code: String::from_str(&env, "XLM"), issuer: None };
+
+        create_bridge_transfer(&env, 1, 1, ChainId::Ethereum, ChainId::Polygon, 1_000_000, 100, asset, user).unwrap();
+        monitor_source_transaction(&env, 1, tx_hash, ChainId::Ethereum, 100).unwrap();
+        mark_transaction_failed(&env, 1).unwrap();
+
+        let info = get_transfer_status(&env, 1).unwrap();
+        assert_eq!(info.status, TransferStatus::Failed);
+    }
+
+    #[test]
+    fn test_get_transfer_status_full_lifecycle() {
+        let env = setup_env();
+        let user = String::from_str(&env, "user123");
+        let tx_hash = String::from_str(&env, "0xabcd1234");
+        let asset = Asset { code: String::from_str(&env, "XLM"), issuer: None };
+
+        // Step 1: Pending
+        create_bridge_transfer(&env, 1, 1, ChainId::Ethereum, ChainId::Polygon, 1_000_000, 100, asset, user).unwrap();
+        assert_eq!(get_transfer_status(&env, 1).unwrap().status, TransferStatus::Pending);
+
+        // Step 2: Source monitoring starts (status stays Pending until validators sign)
+        monitor_source_transaction(&env, 1, tx_hash, ChainId::Ethereum, 100).unwrap();
+        assert_eq!(get_transfer_status(&env, 1).unwrap().status, TransferStatus::Pending);
+
+        // Step 3: ValidatorApproved
+        let val1 = Address::generate(&env);
+        let val2 = Address::generate(&env);
+        add_validator_signature(&env, 1, val1, String::from_str(&env, "s1")).unwrap();
+        add_validator_signature(&env, 1, val2, String::from_str(&env, "s2")).unwrap();
+        assert_eq!(get_transfer_status(&env, 1).unwrap().status, TransferStatus::ValidatorApproved);
+
+        // Step 4: Minting
+        approve_transfer_for_minting(&env, 1).unwrap();
+        assert_eq!(get_transfer_status(&env, 1).unwrap().status, TransferStatus::Minting);
+
+        // Step 5: Complete
+        complete_transfer(&env, 1).unwrap();
+        let final_info = get_transfer_status(&env, 1).unwrap();
+        assert_eq!(final_info.status, TransferStatus::Complete);
+        assert!(final_info.last_status_change >= 1000);
     }
 
     #[test]
