@@ -1,5 +1,6 @@
 use shared::errors::{ErrorCategory, RecoveryStrategy};
-use soroban_sdk::{contractevent, Address, Env, String, Symbol};
+use soroban_sdk::{contractevent, Address, Env, String, Symbol, Vec};
+use crate::storage::WaterfallTierResult;
 
 #[contractevent]
 pub struct WithdrawalQueued {
@@ -227,5 +228,58 @@ pub fn emit_revenue_share_distributed(
             Symbol::new(env, "revenue_share_distributed"),
         ),
         (token.clone(), total_amount, snapshot_ledger),
+    );
+}
+
+// ── #690: Waterfall Distribution event ──────────────────────────────────────
+
+/// Emitted after a waterfall distribution run, listing every tier's allocation.
+pub fn emit_waterfall_distribution(
+    env: &Env,
+    token: &Address,
+    total_distributed: i128,
+    tier_results: &Vec<WaterfallTierResult>,
+) {
+    env.events().publish(
+        (
+            Symbol::new(env, "fee_collector"),
+            Symbol::new(env, "waterfall_distribution"),
+        ),
+        (token.clone(), total_distributed, tier_results.clone()),
+    );
+}
+
+// ── #691: Payout Currency Set event ─────────────────────────────────────────
+
+pub fn emit_payout_currency_set(env: &Env, provider: &Address, preferred_token: &Address) {
+    env.events().publish(
+        (
+            Symbol::new(env, "fee_collector"),
+            Symbol::new(env, "payout_currency_set"),
+        ),
+        (provider.clone(), preferred_token.clone()),
+    );
+}
+
+pub fn emit_fees_claimed_converted(
+    env: &Env,
+    provider: &Address,
+    source_token: &Address,
+    preferred_token: &Address,
+    source_amount: i128,
+    preferred_amount: i128,
+) {
+    env.events().publish(
+        (
+            Symbol::new(env, "fee_collector"),
+            Symbol::new(env, "fees_claimed_converted"),
+        ),
+        (
+            provider.clone(),
+            source_token.clone(),
+            preferred_token.clone(),
+            source_amount,
+            preferred_amount,
+        ),
     );
 }

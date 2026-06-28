@@ -56,12 +56,13 @@ use distribution::{
     DistributionRecipients, DistributionState, VestingCategory, VestingSchedule,
 };
 pub use errors::GovernanceError;
-pub use proposals::GovernanceConfig;
+pub use proposals::{CategoryThreshold, GovernanceConfig, ProposalCategory};
 use proposals::{
     calculate_proposal_statistics, cancel_proposal, configure_governance, create_proposal,
     default_governance_config, execute_proposal, finalize_proposal, get_all_proposals,
-    get_governance_config, get_proposal, Proposal, ProposalStatistics, ProposalStatus,
-    ProposalType, Vote, VoteDelegation, VoteType as GovernanceVoteType,
+    get_category_threshold, get_governance_config, get_proposal, set_category_thresholds,
+    Proposal, ProposalStatistics, ProposalStatus, ProposalType, Vote, VoteDelegation,
+    VoteType as GovernanceVoteType,
 };
 use quadratic_voting::{
     allocate_vote_credits, calculate_marginal_cost, cast_quadratic_vote, compare_voting_systems,
@@ -148,6 +149,8 @@ pub enum StorageKey {
     TreasuryAddress,
     /// Shadow-mode canary upgrade trial state (issue #589).
     ShadowMode,
+    /// #693: Per-category quorum and supermajority thresholds (Map<u32, CategoryThreshold>).
+    CategoryThresholds,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -375,6 +378,31 @@ impl GovernanceContract {
         proposals::configure_governance(&env, &admin, config)
     }
 
+    // ── Issue #693: Category-specific quorum thresholds ───────────────────────
+
+    /// Admin: set per-category quorum and supermajority thresholds.
+    ///
+    /// A value of 0 in either field means "inherit from global GovernanceConfig".
+    /// Thresholds are validated to be ≤ 10 000 bps (100 %).
+    pub fn set_category_thresholds(
+        env: Env,
+        admin: Address,
+        category: ProposalCategory,
+        threshold: CategoryThreshold,
+    ) -> Result<(), GovernanceError> {
+        require_initialized(&env)?;
+        set_category_thresholds(&env, &admin, category, threshold)
+    }
+
+    /// Returns the per-category threshold overrides for `category`, or `None`
+    /// if no override has been configured (global thresholds apply).
+    pub fn get_category_thresholds(
+        env: Env,
+        category: ProposalCategory,
+    ) -> Option<CategoryThreshold> {
+        get_category_threshold(&env, &category)
+    }
+
     /// Configure the spam-deposit requirement for proposal creation.
     ///
     /// `config.amount` is the token amount locked from the proposer. Set to 0
@@ -405,6 +433,8 @@ impl GovernanceContract {
     /// - `title`: Short human-readable title.
     /// - `description`: Full proposal description.
     /// - `execution_payload`: Arbitrary bytes attached to the proposal (e.g. migration notes hash).
+    /// - `category`: Proposal category used to select per-category quorum/supermajority thresholds.
+    /// - `use_quadratic_voting`: When `true`, votes are weighted by sqrt(staked_balance).
     ///
     /// # Returns
     /// The new proposal ID.
@@ -421,6 +451,8 @@ impl GovernanceContract {
         title: String,
         description: String,
         execution_payload: Bytes,
+        category: ProposalCategory,
+        use_quadratic_voting: bool,
     ) -> Result<u64, GovernanceError> {
         require_initialized(&env)?;
         require_not_paused(&env)?;
@@ -431,6 +463,8 @@ impl GovernanceContract {
             title,
             description,
             execution_payload,
+            category,
+            use_quadratic_voting,
         )?;
         proposal_deposit::lock_proposal_deposit(&env, proposal_id, &proposer)?;
         let _ = record_proposal_creation(&env, proposer);

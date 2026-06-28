@@ -7,8 +7,9 @@ mod events;
 mod fee_cache;
 use events::{
     emit_error_reported, emit_fee_collected, emit_fee_rate_updated, emit_fees_claimed,
-    emit_first_trade_fee_waived, emit_network_condition_updated, emit_retry_attempted,
-    emit_treasury_withdrawal, emit_withdrawal_queued, EvtErrorReported, EvtFeeCollected,
+    emit_fees_claimed_converted, emit_first_trade_fee_waived, emit_network_condition_updated,
+    emit_payout_currency_set, emit_retry_attempted, emit_treasury_withdrawal,
+    emit_waterfall_distribution, emit_withdrawal_queued, EvtErrorReported, EvtFeeCollected,
     EvtFeeRateUpdated, EvtFeesClaimed, EvtNetworkConditionUpdated, EvtRetryAttempted,
     EvtTreasuryWithdrawal, EvtWithdrawalQueued,
 };
@@ -27,19 +28,22 @@ pub use storage::BalanceMismatch;
 use storage::{
     get_admin, get_burn_rate, get_failed_fee_collection, get_fee_optimization_config, get_fee_rate,
     get_last_error_report, get_monthly_trade_volume, get_network_condition_score,
-    get_oracle_contract, get_pending_fees, get_queued_withdrawal, get_treasury_balance, has_traded,
-    is_initialized, remove_failed_fee_collection, remove_monthly_trade_volume,
+    get_oracle_contract, get_pending_fees, get_provider_payout_currency, get_queued_withdrawal,
+    get_treasury_balance, get_waterfall_config, has_traded, is_initialized,
+    remove_failed_fee_collection, remove_monthly_trade_volume, remove_provider_payout_currency,
     remove_queued_withdrawal, set_admin, set_burn_rate as set_burn_rate_storage,
     set_failed_fee_collection, set_fee_optimization_config, set_fee_rate as set_fee_rate_storage,
     set_has_traded, set_initialized, set_last_error_report, set_monthly_trade_volume,
     set_network_condition_score, set_oracle_contract as set_oracle_contract_storage,
-    set_pending_fees, set_queued_withdrawal, set_treasury_balance, ErrorReport,
-    FailedFeeCollection, FeeOptimizationConfig, MonthlyTradeVolume, QueuedWithdrawal, StorageKey,
-    MAX_BURN_RATE_BPS, MAX_FEE_RATE_BPS, MIN_FEE_RATE_BPS,
+    set_pending_fees, set_provider_payout_currency,
+    set_queued_withdrawal, set_treasury_balance,
+    set_waterfall_config as set_waterfall_config_storage, ErrorReport, FailedFeeCollection,
+    FeeOptimizationConfig, MonthlyTradeVolume, QueuedWithdrawal, StorageKey, WaterfallConfig,
+    WaterfallTier, WaterfallTierResult, MAX_BURN_RATE_BPS, MAX_FEE_RATE_BPS, MIN_FEE_RATE_BPS,
 };
 
-use soroban_sdk::{contract, contractimpl, contracttype, token, Address, Env, IntoVal, String, Val,
-    Vec};
+use soroban_sdk::{contract, contractimpl, contracttype, token, Address, Env, IntoVal, String,
+    Symbol, Val, Vec};
 
 use shared::errors::{ErrorCategory, RecoveryStrategy};
 use stellar_swipe_common::Asset;
@@ -753,8 +757,13 @@ impl FeeCollector {
     }
 
     /// Claim all pending fee earnings for a provider and token.
-    /// Returns the amount claimed (0 if no pending balance).
-    /// Claim accumulated fees for `provider` in `token`.
+    ///
+    /// If the provider has set a preferred payout currency via
+    /// [`set_payout_currency`] and the preferred token differs from `token`,
+    /// this function attempts to convert the accrued fees at claim time using
+    /// the configured oracle price feed.  On any conversion failure (stale
+    /// oracle, no oracle configured, insufficient treasury balance of the
+    /// preferred token) it silently falls back to settling in `token`.
     ///
     /// Authorization is scoped to `(provider, token)` via `require_auth_for_args`
     /// so a valid signature cannot be replayed against a different token or
@@ -771,24 +780,121 @@ impl FeeCollector {
         let amount = get_pending_fees(&env, &provider, &token);
 
         if amount > 0 {
-            token::Client::new(&env, &token).transfer(
-                &env.current_contract_address(),
-                &provider,
-                &amount,
+            // #691 – honour preferred payout currency when set and conversion succeeds.
+            let converted = if let Some(pref_token) =
+                get_provider_payout_currency(&env, &provider)
+            {
+                if pref_token != token {
+                    Self::try_claim_in_preferred_currency(
+                        &env,
+                        &provider,
+                        &token,
+                        amount,
+                        &pref_token,
+                    )
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+
+            if converted.is_none() {
+                // Default: settle in source token.
+                token::Client::new(&env, &token).transfer(
+                    &env.current_contract_address(),
+                    &provider,
+                    &amount,
+                );
+                set_pending_fees(&env, &provider, &token, 0);
+                emit_fees_claimed(
+                    &env,
+                    EvtFeesClaimed {
+                        provider: provider.clone(),
+                        token: token.clone(),
+                        amount,
+                    },
+                );
+            }
+        } else {
+            emit_fees_claimed(
+                &env,
+                EvtFeesClaimed {
+                    provider: provider.clone(),
+                    token: token.clone(),
+                    amount: 0,
+                },
             );
-            set_pending_fees(&env, &provider, &token, 0);
         }
 
-        emit_fees_claimed(
-            &env,
-            EvtFeesClaimed {
-                provider: provider.clone(),
-                token: token.clone(),
-                amount,
-            },
+        Ok(amount)
+    }
+
+    /// Attempt to convert `source_amount` of `source_token` into `pref_token`
+    /// using the oracle, then transfer `pref_token` from the treasury.
+    ///
+    /// Returns `Some(preferred_amount)` on success, `None` on any failure
+    /// (including stale oracle or insufficient preferred-token treasury balance).
+    fn try_claim_in_preferred_currency(
+        env: &Env,
+        provider: &Address,
+        source_token: &Address,
+        source_amount: i128,
+        pref_token: &Address,
+    ) -> Option<i128> {
+        let oracle_addr = get_oracle_contract(env)?;
+
+        // Ask the oracle for an exchange rate from source_token to pref_token.
+        // Method signature expected: get_rate(from: Address, to: Address) -> i128
+        // where the rate is scaled by ORACLE_RATE_PRECISION (1_000_000).
+        // If the oracle does not support this method or the feed is stale,
+        // try_invoke_contract returns an error and we fall back.
+        const ORACLE_RATE_PRECISION: i128 = 1_000_000;
+        let rate_result = env.try_invoke_contract::<i128, soroban_sdk::Error>(
+            &oracle_addr,
+            &Symbol::new(env, "get_rate"),
+            (source_token.clone(), pref_token.clone()).into_val(env),
         );
 
-        Ok(amount)
+        let rate = match rate_result {
+            Ok(Ok(r)) if r > 0 => r,
+            _ => return None, // oracle stale or unsupported – fall back
+        };
+
+        let pref_amount = source_amount
+            .checked_mul(rate)?
+            .checked_div(ORACLE_RATE_PRECISION)?;
+
+        if pref_amount <= 0 {
+            return None;
+        }
+
+        // Ensure the contract holds enough of the preferred token.
+        let pref_client = token::Client::new(env, pref_token);
+        let pref_balance = pref_client.balance(&env.current_contract_address());
+        if pref_balance < pref_amount {
+            return None;
+        }
+
+        // Execute the conversion: zero out source pending fees and pay preferred.
+        set_pending_fees(env, provider, source_token, 0);
+
+        pref_client.transfer(
+            &env.current_contract_address(),
+            provider,
+            &pref_amount,
+        );
+
+        emit_fees_claimed_converted(
+            env,
+            provider,
+            source_token,
+            pref_token,
+            source_amount,
+            pref_amount,
+        );
+
+        Some(pref_amount)
     }
 
     // ── Issue #366: Provider Earnings Report ─────────────────────────────────
@@ -931,5 +1037,198 @@ impl FeeCollector {
         Ok(reports::get_provider_earnings_report(
             &env, &provider, period,
         ))
+    }
+
+    // ── Issue #690: Fee Distribution Waterfall ───────────────────────────────
+
+    /// Admin: store an ordered waterfall configuration for fee distribution.
+    ///
+    /// Tiers are processed in ascending `priority` order; tiers with the same
+    /// priority value are processed in the order they appear in the Vec.
+    pub fn set_waterfall_config(
+        env: Env,
+        config: WaterfallConfig,
+    ) -> Result<(), ContractError> {
+        if !is_initialized(&env) {
+            return Err(ContractError::NotInitialized);
+        }
+        let admin = get_admin(&env);
+        admin.require_auth();
+        set_waterfall_config_storage(&env, &config);
+        Ok(())
+    }
+
+    /// Returns the currently configured waterfall, or an error if none has been
+    /// configured yet.
+    pub fn get_waterfall_config_fn(env: Env) -> Result<WaterfallConfig, ContractError> {
+        if !is_initialized(&env) {
+            return Err(ContractError::NotInitialized);
+        }
+        get_waterfall_config(&env).ok_or(ContractError::WaterfallNotConfigured)
+    }
+
+    /// Distribute `total_amount` of `token` from the treasury according to the
+    /// configured waterfall, funding higher-priority tiers first.
+    ///
+    /// Each tier receives up to `target_amount`. When funds are insufficient:
+    /// - If remaining >= tier.minimum_amount the tier receives the remaining
+    ///   funds and lower tiers receive nothing.
+    /// - If remaining < tier.minimum_amount the tier is skipped entirely
+    ///   (minimum not met).
+    ///
+    /// Admin auth required.  Emits [`waterfall_distribution`].
+    pub fn distribute_waterfall(
+        env: Env,
+        token: Address,
+        total_amount: i128,
+    ) -> Result<Vec<WaterfallTierResult>, ContractError> {
+        if !is_initialized(&env) {
+            return Err(ContractError::NotInitialized);
+        }
+        let admin = get_admin(&env);
+        admin.require_auth();
+
+        if total_amount <= 0 {
+            return Err(ContractError::InvalidAmount);
+        }
+
+        let config =
+            get_waterfall_config(&env).ok_or(ContractError::WaterfallNotConfigured)?;
+
+        let treasury_bal = get_treasury_balance(&env, &token);
+        if treasury_bal < total_amount {
+            return Err(ContractError::InsufficientTreasuryBalance);
+        }
+
+        // Sort a local index by priority (insertion sort – tier count is small).
+        let n = config.tiers.len();
+        let mut indices: Vec<u32> = Vec::new(&env);
+        let mut i = 0u32;
+        while i < n {
+            indices.push_back(i);
+            i += 1;
+        }
+        // Bubble sort ascending by priority value (lower = funded first).
+        loop {
+            let mut swapped = false;
+            let m = indices.len();
+            let mut j = 0u32;
+            while j + 1 < m {
+                let ia = indices.get(j).unwrap();
+                let ib = indices.get(j + 1).unwrap();
+                let pa = config.tiers.get(ia).unwrap().priority;
+                let pb = config.tiers.get(ib).unwrap().priority;
+                if pa > pb {
+                    indices.set(j, ib);
+                    indices.set(j + 1, ia);
+                    swapped = true;
+                }
+                j += 1;
+            }
+            if !swapped {
+                break;
+            }
+        }
+
+        let token_client = token::Client::new(&env, &token);
+        let mut remaining = total_amount;
+        let mut total_distributed: i128 = 0;
+        let mut tier_results: Vec<WaterfallTierResult> = Vec::new(&env);
+
+        let mut k = 0u32;
+        while k < indices.len() {
+            let tier_idx = indices.get(k).unwrap();
+            let tier: WaterfallTier = config.tiers.get(tier_idx).unwrap();
+
+            let allocated = if remaining >= tier.target_amount {
+                tier.target_amount
+            } else if remaining >= tier.minimum_amount {
+                remaining
+            } else {
+                // Minimum not met – skip this tier.
+                tier_results.push_back(WaterfallTierResult {
+                    name: tier.name,
+                    recipient: tier.recipient,
+                    priority: tier.priority,
+                    allocated: 0,
+                });
+                k += 1;
+                continue;
+            };
+
+            token_client.transfer(
+                &env.current_contract_address(),
+                &tier.recipient,
+                &allocated,
+            );
+            remaining = remaining
+                .checked_sub(allocated)
+                .ok_or(ContractError::ArithmeticOverflow)?;
+            total_distributed = total_distributed
+                .checked_add(allocated)
+                .ok_or(ContractError::ArithmeticOverflow)?;
+
+            tier_results.push_back(WaterfallTierResult {
+                name: tier.name,
+                recipient: tier.recipient,
+                priority: tier.priority,
+                allocated,
+            });
+
+            k += 1;
+        }
+
+        // Deduct from treasury balance.
+        let new_bal = treasury_bal
+            .checked_sub(total_distributed)
+            .ok_or(ContractError::ArithmeticOverflow)?;
+        set_treasury_balance(&env, &token, new_bal);
+
+        emit_waterfall_distribution(&env, &token, total_distributed, &tier_results);
+
+        Ok(tier_results)
+    }
+
+    // ── Issue #691: Provider Settlement Currency ─────────────────────────────
+
+    /// Set or update the preferred payout currency for `provider`.
+    ///
+    /// At [`claim_fees`] time the contract will attempt to convert accrued fees
+    /// into `preferred_token` using the configured oracle price feed.  If the
+    /// oracle feed is stale or unavailable the claim falls back to the default
+    /// settlement token.
+    ///
+    /// Only the provider themselves may call this.
+    pub fn set_payout_currency(
+        env: Env,
+        provider: Address,
+        preferred_token: Address,
+    ) -> Result<(), ContractError> {
+        if !is_initialized(&env) {
+            return Err(ContractError::NotInitialized);
+        }
+        provider.require_auth();
+        set_provider_payout_currency(&env, &provider, &preferred_token);
+        emit_payout_currency_set(&env, &provider, &preferred_token);
+        Ok(())
+    }
+
+    /// Clear the payout currency preference for `provider`, reverting to the
+    /// default settlement asset.
+    ///
+    /// Only the provider themselves may call this.
+    pub fn clear_payout_currency(env: Env, provider: Address) -> Result<(), ContractError> {
+        if !is_initialized(&env) {
+            return Err(ContractError::NotInitialized);
+        }
+        provider.require_auth();
+        remove_provider_payout_currency(&env, &provider);
+        Ok(())
+    }
+
+    /// Returns the preferred payout token for `provider`, or `None` if the
+    /// provider has not set a preference.
+    pub fn get_payout_currency(env: Env, provider: Address) -> Option<Address> {
+        get_provider_payout_currency(&env, &provider)
     }
 }
