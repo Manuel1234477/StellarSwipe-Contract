@@ -4,6 +4,7 @@ use soroban_sdk::{contract, contractimpl, contracttype, Address, Env, String, Sy
 
 mod admin;
 mod advanced_risk;
+mod loss_streak;
 #[cfg(feature = "testutils")]
 pub mod amm_bridge;
 #[cfg(not(feature = "testutils"))]
@@ -125,8 +126,14 @@ pub struct TradeSimulation {
 /// Contract
 /// ==========================
 
-soroban_sdk::contractmeta!(key = "version", val = env!("CARGO_PKG_VERSION"));
-soroban_sdk::contractmeta!(key = "git_commit", val = env!("GIT_COMMIT_HASH"));
+soroban_sdk::contractmeta!(
+    key = "SourceHash",
+    val = env!("STELLAR_SOURCE_HASH")
+);
+soroban_sdk::contractmeta!(
+    key = "GitCommit",
+    val = env!("STELLAR_GIT_COMMIT")
+);
 
 #[contract]
 pub struct AutoTradeContract;
@@ -588,6 +595,9 @@ impl AutoTradeContract {
             return Err(AutoTradeError::RateLimited);
         }
 
+        // Check loss-streak pause (Issue #698)
+        loss_streak::check_loss_streak_paused(&env, &user)?;
+
         let signal = storage::get_signal(&env, signal_id).ok_or(AutoTradeError::SignalNotFound)?;
 
         if env.ledger().timestamp() > signal.expiry {
@@ -653,6 +663,9 @@ impl AutoTradeContract {
         };
 
         logging::record_trade_outcome(&env, &status);
+
+        // Record loss-streak outcome (Issue #698)
+        loss_streak::record_trade_outcome(&env, &user, &status);
 
         admin::update_cb_stats(
             &env,
@@ -1129,6 +1142,40 @@ impl AutoTradeContract {
             would_succeed: false,
             failure_reason: Some(String::from_str(env, reason)),
         }
+    }
+
+    // ── Loss-streak pause (Issue #698) ──────────────────────────────────────────
+
+    /// Get the loss-streak threshold configuration.
+    pub fn get_loss_streak_config(env: Env) -> storage::LossStreakConfig {
+        storage::get_loss_streak_config(&env)
+    }
+
+    /// Set the loss-streak threshold (admin only).
+    pub fn set_loss_streak_threshold(
+        env: Env,
+        caller: Address,
+        threshold: u32,
+    ) -> Result<(), AutoTradeError> {
+        loss_streak::set_loss_streak_threshold(&env, &caller, threshold)
+    }
+
+    /// Get the per-user consecutive-loss counter.
+    pub fn get_loss_streak_counter(env: Env, user: Address) -> storage::LossStreakCounter {
+        storage::get_loss_streak_counter(&env, &user)
+    }
+
+    /// Check whether a user is currently paused due to loss-streak.
+    pub fn is_loss_streak_paused(env: Env, user: Address) -> bool {
+        storage::is_loss_streak_paused(&env, &user)
+    }
+
+    /// Explicitly resume auto-trading after a loss-streak pause (user only).
+    pub fn resume_after_loss_streak(
+        env: Env,
+        user: Address,
+    ) -> Result<(), AutoTradeError> {
+        loss_streak::resume_after_loss_streak(&env, &user)
     }
 
     /// Returns estimated storage usage metrics.
@@ -1881,6 +1928,89 @@ impl AutoTradeContract {
     pub fn mark_conditional_executed(env: Env, id: u64) -> Result<(), AutoTradeError> {
         conditional::mark_executed(&env, id)
     }
+
+    // ── Per-trade escrow (Issue: isolated custody) ────────────────────────────
+
+    /// Initiate an isolated escrow record for `trade_id`, locking `amount` of
+    /// `asset` for `originator` away from any shared pool.
+    pub fn initiate_escrow(
+        env: Env,
+        trade_id: soroban_sdk::BytesN<32>,
+        originator: Address,
+        asset: u32,
+        amount: i128,
+    ) -> Result<(), AutoTradeError> {
+        originator.require_auth();
+        escrow::initiate_escrow(&env, trade_id, originator, asset, amount)
+    }
+
+    /// Settle the escrow for `trade_id`: release funds to `destination` and
+    /// clear the active escrow record.  Fails if already settled or cancelled.
+    pub fn settle_escrow(
+        env: Env,
+        caller: Address,
+        trade_id: soroban_sdk::BytesN<32>,
+        destination: Address,
+    ) -> Result<escrow::EscrowRecord, AutoTradeError> {
+        admin::require_admin(&env, &caller)?;
+        escrow::settle_escrow(&env, &trade_id, destination)
+    }
+
+    /// Cancel the escrow for `trade_id`: return funds to the originator and
+    /// clear the active escrow record.  Fails if already settled or cancelled.
+    pub fn cancel_escrow(
+        env: Env,
+        caller: Address,
+        trade_id: soroban_sdk::BytesN<32>,
+    ) -> Result<escrow::EscrowRecord, AutoTradeError> {
+        // Either the admin or the originator may cancel.
+        let record =
+            escrow::get_escrow(&env, &trade_id).ok_or(AutoTradeError::EscrowNotFound)?;
+        if record.originator != caller {
+            admin::require_admin(&env, &caller)?;
+        } else {
+            caller.require_auth();
+        }
+        escrow::cancel_escrow(&env, &trade_id)
+    }
+
+    /// Read the current escrow record for `trade_id`.
+    pub fn get_escrow(
+        env: Env,
+        trade_id: soroban_sdk::BytesN<32>,
+    ) -> Option<escrow::EscrowRecord> {
+        escrow::get_escrow(&env, &trade_id)
+    }
+
+    // ── Dead man's switch (Issue: admin inactivity safety) ───────────────────
+
+    /// Configure the inactivity window that must elapse before anyone can trigger
+    /// an automatic pause (admin only).
+    pub fn set_inactivity_window(
+        env: Env,
+        caller: Address,
+        window_secs: u64,
+    ) -> Result<(), AutoTradeError> {
+        admin::set_inactivity_window(&env, &caller, window_secs)
+    }
+
+    /// Get the currently configured inactivity window in seconds.
+    pub fn get_inactivity_window(env: Env) -> u64 {
+        admin::get_inactivity_window(&env)
+    }
+
+    /// Get the timestamp of the last qualifying admin action.
+    pub fn get_last_admin_action_at(env: Env) -> u64 {
+        admin::get_last_admin_action_at(&env)
+    }
+
+    /// Trigger an automatic pause of all sensitive operations when the admin
+    /// inactivity window has elapsed.  Any caller may invoke this.
+    /// A subsequent admin action resets the timer; the admin then lifts the
+    /// pause via `unpause_category`.
+    pub fn trigger_inactivity_pause(env: Env, caller: Address) -> Result<(), AutoTradeError> {
+        admin::trigger_inactivity_pause(&env, &caller)
+    }
 }
 
 // Disabled: test.rs has pre-existing corruption (unclosed delimiters).
@@ -1888,6 +2018,8 @@ impl AutoTradeContract {
 // mod test;
 #[cfg(test)]
 mod test_admin_transfer;
+#[cfg(test)]
+mod test_dead_mans_switch;
 mod test_oracle_whitelist;
 
 // ── Oracle integration tests ─────────────────────────────────────────────────

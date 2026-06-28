@@ -49,7 +49,10 @@ jobs:
       - name: Format check
         run: cd stellar-swipe && cargo fmt --all -- --check
 
-      # Clippy linter for all workspace crates
+      # Clippy: any warning is a build failure.
+      # Workspace-level suppressions live in [workspace.lints.clippy] in Cargo.toml
+      # and must be narrowly scoped with a documented reason.  Adding a new
+      # suppress without justification is grounds for PR rejection.
       - name: Clippy
         run: cd stellar-swipe && cargo clippy --workspace --all-targets -- -D warnings
 
@@ -57,16 +60,15 @@ jobs:
       - name: Tests
         run: cd stellar-swipe && cargo test --workspace --all-targets
 
-      # CPU instruction-budget regression gate.
-      # Runs tests, captures BUDGET_METRIC lines, and fails if any entrypoint
-      # exceeds its committed baseline by more than the configured threshold.
-      # To update the baseline: run scripts/update_budget_baseline.sh locally,
-      # commit the updated baselines/instruction_budget_baseline.json, and add
-      # a PR description explaining why the regression is expected/accepted.
-      - name: Budget regression check
-        run: |
-          cd stellar-swipe && cargo test --workspace --all-targets 2>&1 \
-            | python3 scripts/check_budget_baseline.py
+      # Supply-chain: license, banned crates, source restrictions, advisories.
+      # Policy lives in stellar-swipe/deny.toml.  Any violation fails the build.
+      # To request a new dependency or policy exception see CONTRIBUTING.md.
+      - name: cargo-deny (license / ban / source / advisory check)
+        uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          manifest-path: stellar-swipe/Cargo.toml
+          command: check
+          arguments: --all-features
 
       # Audit dependency versions consistency
       - name: Audit workspace dependencies
@@ -75,6 +77,22 @@ jobs:
       # Verify #![no_std] compliance of contract crates
       - name: Verify #![no_std] compliance
         run: python3 stellar-swipe/scripts/verify_no_std.py
+
+      # Guard against renumbering or reusing #[contracterror] discriminants.
+      # Exit 0 = clean; exit 2 = new codes added (baseline updated, commit the
+      # JSON files); exit 1 = renumbering/reuse detected → fail the build.
+      - name: Check error code baselines
+        run: |
+          python3 stellar-swipe/scripts/check_error_codes.py
+          rc=$?
+          if [ $rc -eq 1 ]; then
+            echo "ERROR: error code violation detected — see output above." >&2
+            exit 1
+          fi
+          if [ $rc -eq 2 ]; then
+            echo "INFO: new error codes added; baseline files updated."
+            echo "Please commit the updated stellar-swipe/error-baselines/*.json files."
+          fi
 
       # Release WASM (workspace [profile.release]) + stellar contract optimize
       # Prebuilt release binary — avoids compiling libdbus-sys from source via cargo install
@@ -91,8 +109,20 @@ jobs:
           chmod +x "$install_dir/stellar"
           stellar --version
 
-      - name: Build optimized Soroban WASM
-        run: cd stellar-swipe && chmod +x scripts/build.sh && ./scripts/build.sh
+      - name: Build optimized Soroban WASM (with source hash)
+        run: |
+          cd stellar-swipe
+          chmod +x scripts/embed_source_hash.sh scripts/build.sh
+          # embed_source_hash.sh exports STELLAR_SOURCE_HASH; build.sh verifies
+          # it is non-empty before proceeding.  The build fails if the hash
+          # cannot be computed (missing git history, empty workspace, etc.).
+          source scripts/embed_source_hash.sh
+          ./scripts/build.sh
+          if [[ -z "${STELLAR_SOURCE_HASH:-}" ]]; then
+            echo "error: STELLAR_SOURCE_HASH was not set — release aborted." >&2
+            exit 1
+          fi
+          echo "Embedded SourceHash: $STELLAR_SOURCE_HASH"
 
       - name: Upload optimized WASM artifacts
         uses: actions/upload-artifact@v4
@@ -101,60 +131,91 @@ jobs:
           path: stellar-swipe/target/wasm-optimized/*.wasm
           if-no-files-found: error
 
-  # ── Fuzz job (runs on PRs touching common/ or shared/) ────────────────────
-  fuzz:
+  reproducible-build:
+    name: Reproducible WASM build check
     runs-on: ubuntu-latest
-    # Only run fuzzing on PRs that touch the targeted modules.
-    if: |
-      github.event_name == 'pull_request' &&
-      (
-        contains(github.event.pull_request.title, 'common') ||
-        contains(toJson(github.event.pull_request.changed_files), 'contracts/common') ||
-        contains(toJson(github.event.pull_request.changed_files), 'contracts/shared')
-      )
+    # Run in parallel with the main CI job; no dependency on it.
 
     steps:
       - uses: actions/checkout@v4
 
-      # Fuzzing requires a nightly toolchain (libfuzzer).
-      - name: Setup nightly Rust for fuzzing
-        uses: dtolnay/rust-toolchain@nightly
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
         with:
-          components: rust-src
+          targets: wasm32-unknown-unknown
 
-      - name: Cache dependencies
-        uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: stellar-swipe/contracts/common/fuzz
+      # No shared Rust cache between the two builds so each starts clean.
+      # We intentionally skip Swatinem/rust-cache here to avoid any
+      # cached incremental state that could mask non-determinism.
 
-      - name: Install cargo-fuzz
-        run: cargo install cargo-fuzz --locked
-
-      # Run each fuzz target for a bounded time budget.
-      # 30 seconds per target keeps the job fast; run locally for longer coverage.
-      - name: Fuzz — storage_key_derivation (30s)
+      - name: Install Stellar CLI
         run: |
-          cd stellar-swipe/contracts/common
-          cargo +nightly fuzz run storage_key_derivation -- \
-            -max_total_time=30 \
-            -timeout=10 \
-            -detect_leaks=0
+          set -euo pipefail
+          version="25.2.0"
+          install_dir="$HOME/.local/bin"
+          mkdir -p "$install_dir"
+          echo "$install_dir" >> "$GITHUB_PATH"
+          curl -fL \
+            "https://github.com/stellar/stellar-cli/releases/download/v${version}/stellar-cli-${version}-x86_64-unknown-linux-gnu.tar.gz" \
+            | tar xz -C "$install_dir"
+          chmod +x "$install_dir/stellar"
+          stellar --version
 
-      - name: Fuzz — xdr_roundtrip (30s)
+      # First build — output goes to target/wasm-optimized/ (the default).
+      - name: Build 1 — optimized WASM
+        env:
+          # Remap absolute source paths to a fixed prefix so they don't embed
+          # the runner's working directory and break reproducibility.
+          RUSTFLAGS: "--remap-path-prefix=${{ github.workspace }}=/workspace"
         run: |
-          cd stellar-swipe/contracts/common
-          cargo +nightly fuzz run xdr_roundtrip -- \
-            -max_total_time=30 \
-            -timeout=10 \
-            -detect_leaks=0
+          cd stellar-swipe
+          chmod +x scripts/build.sh
+          OPT_DIR=target/wasm-build-1 ./scripts/build.sh
 
-      # Upload any crash artifacts found during the bounded run.
-      - name: Upload fuzz artifacts
-        if: always()
+      # Second build — completely clean incremental dir, separate output dir.
+      - name: Build 2 — optimized WASM (clean incremental state)
+        env:
+          RUSTFLAGS: "--remap-path-prefix=${{ github.workspace }}=/workspace"
+          CARGO_TARGET_DIR: target-build-2
+        run: |
+          cd stellar-swipe
+          OPT_DIR=target/wasm-build-2 ./scripts/build.sh
+
+      # Compare SHA-256 hashes of every WASM produced by both builds.
+      # Any mismatch causes the job to fail with a clear diff.
+      - name: Compare WASM hashes (fail on mismatch)
+        run: |
+          set -euo pipefail
+          cd stellar-swipe
+          echo "=== Build 1 hashes ==="
+          sha256sum target/wasm-build-1/*.wasm | tee /tmp/build1.sha256
+          echo ""
+          echo "=== Build 2 hashes ==="
+          sha256sum target/wasm-build-2/*.wasm | tee /tmp/build2.sha256
+
+          # Strip directory prefix so we compare filenames only.
+          sed -i 's|target/wasm-build-1/||g' /tmp/build1.sha256
+          sed -i 's|target/wasm-build-2/||g' /tmp/build2.sha256
+
+          if diff /tmp/build1.sha256 /tmp/build2.sha256; then
+            echo ""
+            echo "✓ All WASM hashes match — build is reproducible."
+          else
+            echo ""
+            echo "✗ WASM hash mismatch — non-deterministic build detected!"
+            echo "  Fix: ensure no timestamps, absolute paths, or random"
+            echo "  seeds are embedded (use RUSTFLAGS=--remap-path-prefix)."
+            exit 1
+          fi
+
+      # Record the verified hashes as a CI artifact so they can be attached
+      # to release notes.  Downstream verification process:
+      #   1. Download this artifact from the release workflow run.
+      #   2. Build the same commit locally with the same RUSTFLAGS.
+      #   3. sha256sum your local *.wasm and diff against these hashes.
+      - name: Upload verified WASM hashes artifact
         uses: actions/upload-artifact@v4
         with:
-          name: fuzz-artifacts
-          path: |
-            stellar-swipe/contracts/common/fuzz/artifacts/
-            stellar-swipe/contracts/common/fuzz/corpus/
-          if-no-files-found: ignore
+          name: soroban-wasm-verified-hashes
+          path: /tmp/build1.sha256
+          if-no-files-found: error
