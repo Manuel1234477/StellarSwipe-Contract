@@ -24,4 +24,7 @@ pub enum ContractError {
     FailedCollectionNotFound = 18,
     RetryLimitExceeded = 19,
     IterationLimitExceeded = 20,
+    WaterfallNotConfigured = 21,
+    PreferredTokenInsufficient = 22,
+    PayoutCurrencyUnchanged = 23,
 }

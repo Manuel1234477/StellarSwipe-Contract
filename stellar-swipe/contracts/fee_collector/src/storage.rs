@@ -3,6 +3,53 @@ use shared::initializable;
 use soroban_sdk::{contracttype, Address, Env, String, Vec};
 use stellar_swipe_common::Asset;
 
+// ── #690: Fee Distribution Waterfall ────────────────────────────────────────
+
+/// A single tier in the fee distribution waterfall, processed in ascending
+/// priority order (lower `priority` value = funded first).
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct WaterfallTier {
+    /// Human-readable label (e.g. "treasury", "insurance", "rewards").
+    pub name: String,
+    /// Lower value = higher priority. Tiers are processed in ascending order.
+    pub priority: u32,
+    /// Full allocation for this tier; lower-priority tiers receive leftovers.
+    pub target_amount: i128,
+    /// Minimum the tier must receive to be funded at all. If remaining funds
+    /// fall below this, the tier receives nothing.
+    pub minimum_amount: i128,
+    /// Address that receives the allocation for this tier.
+    pub recipient: Address,
+}
+
+/// Admin-configurable ordered waterfall of fee destinations.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct WaterfallConfig {
+    pub tiers: Vec<WaterfallTier>,
+}
+
+/// Per-tier allocation record emitted in the waterfall_distribution event.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct WaterfallTierResult {
+    pub name: String,
+    pub recipient: Address,
+    pub priority: u32,
+    pub allocated: i128,
+}
+
+// ── #691: Provider Settlement Currency ──────────────────────────────────────
+
+/// Stored preference for a provider's claim payout currency.
+/// `preferred_token` is the SEP-41 token contract to receive fees in.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct PayoutCurrency {
+    pub preferred_token: Address,
+}
+
 pub const MAX_FEE_RATE_BPS: u32 = 100; // 1%
 pub const MIN_FEE_RATE_BPS: u32 = 1; // 0.01%
 pub const DEFAULT_FEE_RATE_BPS: u32 = 30; // 0.3%
@@ -56,6 +103,10 @@ pub enum StorageKey {
     LastErrorReport,
     /// Persisted failed fee collection operation for retry.
     FailedFeeCollection(String),
+    /// #690: Admin-configured waterfall distribution tiers.
+    WaterfallConfig,
+    /// #691: Per-provider preferred payout token.
+    ProviderPayoutCurrency(Address),
 }
 
 #[contracttype]
@@ -454,4 +505,42 @@ pub fn clear_revenue_share_pool(env: &Env, token: &Address) {
     env.storage()
         .persistent()
         .remove(&StorageKey::RevenueSharePool(token.clone()));
+}
+
+// ── #690: Waterfall Config ───────────────────────────────────────────────────
+
+pub fn get_waterfall_config(env: &Env) -> Option<WaterfallConfig> {
+    env.storage()
+        .instance()
+        .get(&StorageKey::WaterfallConfig)
+}
+
+pub fn set_waterfall_config(env: &Env, config: &WaterfallConfig) {
+    env.storage()
+        .instance()
+        .set(&StorageKey::WaterfallConfig, config);
+}
+
+// ── #691: Provider Payout Currency ──────────────────────────────────────────
+
+pub fn get_provider_payout_currency(env: &Env, provider: &Address) -> Option<Address> {
+    env.storage()
+        .persistent()
+        .get::<_, PayoutCurrency>(&StorageKey::ProviderPayoutCurrency(provider.clone()))
+        .map(|p| p.preferred_token)
+}
+
+pub fn set_provider_payout_currency(env: &Env, provider: &Address, preferred_token: &Address) {
+    env.storage().persistent().set(
+        &StorageKey::ProviderPayoutCurrency(provider.clone()),
+        &PayoutCurrency {
+            preferred_token: preferred_token.clone(),
+        },
+    );
+}
+
+pub fn remove_provider_payout_currency(env: &Env, provider: &Address) {
+    env.storage()
+        .persistent()
+        .remove(&StorageKey::ProviderPayoutCurrency(provider.clone()));
 }

@@ -7,6 +7,50 @@ use crate::{
     require_admin, GovernanceError, StorageKey,
 };
 
+// ── #692: Integer square root (Newton's method, no floating-point) ───────────
+
+/// Compute floor(sqrt(n)) using integer arithmetic only.
+pub fn isqrt(n: i128) -> i128 {
+    if n <= 0 {
+        return 0;
+    }
+    let mut x = n;
+    let mut y = (x + 1) / 2;
+    while y < x {
+        x = y;
+        y = (x + n / x) / 2;
+    }
+    x
+}
+
+// ── #693: Proposal Category ──────────────────────────────────────────────────
+
+/// Classification for a governance proposal.  Each category can have its own
+/// quorum and supermajority threshold configured by the admin.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ProposalCategory {
+    /// Low-risk configuration adjustments (e.g. fee rate tweaks).
+    ParameterChange,
+    /// High-risk WASM upgrades to any contract.
+    ContractUpgrade,
+    /// Treasury asset transfers to external addresses.
+    TreasuryTransfer,
+    /// Catch-all for proposals that don't fit the above categories.
+    General,
+}
+
+/// Per-category quorum and supermajority overrides. Values are in basis points
+/// (10 000 = 100 %). A value of 0 means "use the global GovernanceConfig".
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CategoryThreshold {
+    /// Minimum participation as a fraction of total supply (bps, 0 = global).
+    pub quorum_bps: u32,
+    /// Required for-vote fraction of cast votes (bps, 0 = global).
+    pub supermajority_bps: u32,
+}
+
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ProposalType {
@@ -65,6 +109,16 @@ pub struct Proposal {
     pub voters: Map<Address, Vote>,
     pub voter_list: Vec<Address>,
     pub executed_at: Option<u64>,
+    // ── #693: Category classification ────────────────────────────────────────
+    /// Category used to select per-category quorum/supermajority thresholds.
+    pub category: ProposalCategory,
+    // ── #692: Per-proposal quadratic voting flag ──────────────────────────────
+    /// When `true`, each voter's effective weight is floor(sqrt(staked_balance))
+    /// instead of the raw staked balance.
+    pub use_quadratic_voting: bool,
+    /// Sum of floor(sqrt(p)) for all snapshotted holders at proposal creation.
+    /// Used as the quadratic-adjusted total supply for quorum checks.
+    pub quadratic_total_supply: i128,
 }
 
 #[contracttype]
@@ -201,6 +255,8 @@ pub fn create_proposal(
     title: String,
     description: String,
     execution_payload: Bytes,
+    category: ProposalCategory,
+    use_quadratic_voting: bool,
 ) -> Result<u64, GovernanceError> {
     proposer.require_auth();
     if title.is_empty() || description.is_empty() {
@@ -223,12 +279,17 @@ pub fn create_proposal(
     // or unstaking after this point cannot affect votes on this proposal.
     let holders = get_holders(env);
     let mut snapshots: Map<Address, i128> = Map::new(env);
+    // #692: accumulate the quadratic total supply at snapshot time.
+    let mut quadratic_total_supply: i128 = 0;
     let mut hi = 0;
     while hi < holders.len() {
         let h = holders.get(hi).unwrap();
         let p = get_effective_voting_power(env, &h);
         if p > 0 {
             snapshots.set(h, p);
+            if use_quadratic_voting {
+                quadratic_total_supply = quadratic_total_supply.saturating_add(isqrt(p));
+            }
         }
         hi += 1;
     }
@@ -253,6 +314,9 @@ pub fn create_proposal(
         voters: Map::new(env),
         voter_list: Vec::new(env),
         executed_at: None,
+        category,
+        use_quadratic_voting,
+        quadratic_total_supply,
     };
 
     state.proposals.set(id, proposal.clone());
@@ -309,10 +373,22 @@ pub fn cast_vote(
         return Err(GovernanceError::AlreadyVoted);
     }
 
-    let power = get_vote_snapshot(env, proposal_id, &voter).unwrap_or(0);
-    if power <= 0 {
+    let raw_power = get_vote_snapshot(env, proposal_id, &voter).unwrap_or(0);
+    if raw_power <= 0 {
         return Err(GovernanceError::NoVotingPower);
     }
+
+    // #692: when quadratic voting is enabled the effective weight is
+    // floor(sqrt(staked_balance)) rather than the raw balance.
+    let power = if proposal.use_quadratic_voting {
+        let q = isqrt(raw_power);
+        if q <= 0 {
+            return Err(GovernanceError::NoVotingPower);
+        }
+        q
+    } else {
+        raw_power
+    };
 
     let vote = Vote {
         voter: voter.clone(),
@@ -345,18 +421,29 @@ pub fn finalize_proposal(env: &Env, proposal_id: u64) -> Result<ProposalStatus, 
     }
 
     let cfg = get_governance_config(env);
+
+    // #693: look up category-specific thresholds, fall back to global config.
+    let (quorum_bps, approval_bps) = resolve_category_thresholds(env, &proposal.category, &cfg);
+
     let total_votes = proposal
         .votes_for
         .saturating_add(proposal.votes_against)
         .saturating_add(proposal.votes_abstain);
-    let total_supply = get_total_supply(env)?;
 
-    if total_supply <= 0 {
-        return Err(GovernanceError::InvalidSupply);
-    }
+    // #692: when quadratic voting is active, compare against the quadratic
+    // total supply stored at proposal creation rather than the linear supply.
+    let reference_supply = if proposal.use_quadratic_voting && proposal.quadratic_total_supply > 0 {
+        proposal.quadratic_total_supply
+    } else {
+        let ts = get_total_supply(env)?;
+        if ts <= 0 {
+            return Err(GovernanceError::InvalidSupply);
+        }
+        ts
+    };
 
     let quorum_met = total_votes.saturating_mul(BPS_DENOMINATOR)
-        >= total_supply.saturating_mul(cfg.quorum_threshold as i128);
+        >= reference_supply.saturating_mul(quorum_bps as i128);
 
     if !quorum_met {
         proposal.status = ProposalStatus::Failed;
@@ -367,7 +454,7 @@ pub fn finalize_proposal(env: &Env, proposal_id: u64) -> Result<ProposalStatus, 
     let cast_votes = proposal.votes_for.saturating_add(proposal.votes_against);
     let approved = cast_votes > 0
         && proposal.votes_for.saturating_mul(BPS_DENOMINATOR)
-            >= cast_votes.saturating_mul(cfg.approval_threshold as i128);
+            >= cast_votes.saturating_mul(approval_bps as i128);
 
     proposal.status = if approved {
         ProposalStatus::Succeeded
@@ -763,4 +850,80 @@ fn contains_address(list: &Vec<Address>, target: &Address) -> bool {
         i += 1;
     }
     false
+}
+
+// ── #693: Category threshold helpers ─────────────────────────────────────────
+
+/// Return `(quorum_bps, supermajority_bps)` for the given category, falling
+/// back to the global [`GovernanceConfig`] when no per-category override exists
+/// or when the stored values are 0.
+pub fn resolve_category_thresholds(
+    env: &Env,
+    category: &ProposalCategory,
+    global: &GovernanceConfig,
+) -> (u32, u32) {
+    let thresholds: Map<u32, CategoryThreshold> = env
+        .storage()
+        .instance()
+        .get(&StorageKey::CategoryThresholds)
+        .unwrap_or_else(|| Map::new(env));
+
+    let key = category_to_key(category);
+    if let Some(t) = thresholds.get(key) {
+        let quorum = if t.quorum_bps > 0 {
+            t.quorum_bps
+        } else {
+            global.quorum_threshold
+        };
+        let approval = if t.supermajority_bps > 0 {
+            t.supermajority_bps
+        } else {
+            global.approval_threshold
+        };
+        (quorum, approval)
+    } else {
+        (global.quorum_threshold, global.approval_threshold)
+    }
+}
+
+/// Admin-callable: store per-category quorum and supermajority overrides.
+pub fn set_category_thresholds(
+    env: &Env,
+    admin: &Address,
+    category: ProposalCategory,
+    threshold: CategoryThreshold,
+) -> Result<(), GovernanceError> {
+    require_admin(env, admin)?;
+    if threshold.quorum_bps > 10_000 || threshold.supermajority_bps > 10_000 {
+        return Err(GovernanceError::InvalidGovernanceConfig);
+    }
+    let mut thresholds: Map<u32, CategoryThreshold> = env
+        .storage()
+        .instance()
+        .get(&StorageKey::CategoryThresholds)
+        .unwrap_or_else(|| Map::new(env));
+    thresholds.set(category_to_key(&category), threshold);
+    env.storage()
+        .instance()
+        .set(&StorageKey::CategoryThresholds, &thresholds);
+    Ok(())
+}
+
+/// Read per-category thresholds for a given category (returns default if not set).
+pub fn get_category_threshold(env: &Env, category: &ProposalCategory) -> Option<CategoryThreshold> {
+    let thresholds: Map<u32, CategoryThreshold> = env
+        .storage()
+        .instance()
+        .get(&StorageKey::CategoryThresholds)
+        .unwrap_or_else(|| Map::new(env));
+    thresholds.get(category_to_key(category))
+}
+
+fn category_to_key(category: &ProposalCategory) -> u32 {
+    match category {
+        ProposalCategory::ParameterChange => 0,
+        ProposalCategory::ContractUpgrade => 1,
+        ProposalCategory::TreasuryTransfer => 2,
+        ProposalCategory::General => 3,
+    }
 }
