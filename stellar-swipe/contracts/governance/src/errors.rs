@@ -70,4 +70,6 @@ impl GovernanceError {
     pub const ContractPaused: GovernanceError = GovernanceError::Unauthorized;
     pub const InvalidCalibrationConfig: GovernanceError = GovernanceError::InvalidGovernanceConfig;
     pub const IterationLimitExceeded: GovernanceError = GovernanceError::InvalidCommitteeAction;
+    /// Vote rejected because the mandatory discussion window has not yet elapsed (Issue #667).
+    pub const DiscussionPeriodActive: GovernanceError = GovernanceError::VotingNotStarted;
 }

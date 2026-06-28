@@ -74,6 +74,16 @@ pub fn compute_get_pnl(env: &Env, user: Address) -> PnlSummary {
         }
     }
 
+    // Include FIFO-derived realized P&L when present.
+    let fifo_realized: i128 = env
+        .storage()
+        .persistent()
+        .get(&DataKey::UserFifoRealizedPnl(user.clone()))
+        .unwrap_or(0);
+    if let Some(s) = realized.checked_add(fifo_realized) {
+        realized = s;
+    }
+
     let current_price = OnChainOracleClient { address: oracle }
         .get_price(env, asset_pair)
         .ok()

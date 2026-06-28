@@ -65,4 +65,9 @@ pub enum DataKey {
     /// Admin-configurable Herfindahl concentration score threshold (issue #684).
     /// Expressed in basis points (0–10 000). Default: 5 000 (HHI ≥ 0.5).
     ConcentrationThreshold,
+    /// FIFO cost-lot queue for a user. Each `add_cost_lot` call appends;
+    /// `close_fifo` consumes from the front.
+    UserFifoLots(Address),
+    /// Cumulative realized P&L from FIFO lot consumption.
+    UserFifoRealizedPnl(Address),
 }

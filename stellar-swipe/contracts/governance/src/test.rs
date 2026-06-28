@@ -824,6 +824,7 @@ fn timelock_queue_execute_and_cancel_flow() {
         quorum_threshold: 1_000,
         approval_threshold: 5_000,
         execution_delay: 60,
+        discussion_duration: 0,
     };
     client.configure_governance(&admin, &cfg);
     client.initialize_timelock(&admin, &3_600u64, &(7 * 86_400u64), &admin);
@@ -879,6 +880,7 @@ fn queue_underfunded_treasury_spend_action(
         quorum_threshold: 1_000,
         approval_threshold: 5_000,
         execution_delay: 60,
+        discussion_duration: 0,
     };
     client.configure_governance(admin, &cfg);
     client.initialize_timelock(admin, &3_600u64, &(7 * 86_400u64), admin);

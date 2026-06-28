@@ -4,6 +4,7 @@ use crate::validation::{
     check_duplicate_signal, check_price_reasonableness, validate_rationale_hash_string,
 };
 use soroban_sdk::{contracttype, Address, Env, Map, String};
+use stellar_swipe_common::sanitize_string;
 
 #[contracttype]
 #[derive(Clone, Debug, PartialEq)]
@@ -72,11 +73,11 @@ pub fn submit_signal(
         return Err(Error::InvalidPrice);
     }
 
-    // Validate rationale
-    let rationale_len = rationale.to_bytes().len();
-    if rationale_len == 0 || rationale_len > 500 {
+    // Validate rationale: non-empty, max 500 bytes, no control characters.
+    if rationale.to_bytes().len() == 0 {
         return Err(Error::EmptyRationale);
     }
+    sanitize_string(env, &rationale, 500).map_err(|_| Error::EmptyRationale)?;
 
     // Validate rationale hash (must be present and not all zeros)
     validate_rationale_hash_string(env, &rationale_hash).map_err(|e| match e {

@@ -1,5 +1,5 @@
 use soroban_sdk::{contracttype, symbol_short, Address, Bytes, Env, Map, String, Vec};
-use stellar_swipe_common::Asset;
+use stellar_swipe_common::{sanitize_string, Asset};
 
 use crate::{
     add_balance, checked_add, checked_mul, checked_sub, get_holders, get_staked_balance,
@@ -109,6 +109,9 @@ pub struct Proposal {
     pub voters: Map<Address, Vote>,
     pub voter_list: Vec<Address>,
     pub executed_at: Option<u64>,
+    // ── #667: Mandatory discussion period ────────────────────────────────────
+    /// Timestamp after which votes are accepted. Zero means no discussion window.
+    pub discussion_ends_at: u64,
     // ── #693: Category classification ────────────────────────────────────────
     /// Category used to select per-category quorum/supermajority thresholds.
     pub category: ProposalCategory,
@@ -130,6 +133,9 @@ pub struct GovernanceConfig {
     pub quorum_threshold: u32,
     pub approval_threshold: u32,
     pub execution_delay: u64,
+    /// Mandatory discussion window (seconds) before votes can be cast (Issue #667).
+    /// A value of 0 disables the discussion period.
+    pub discussion_duration: u64,
 }
 
 #[contracttype]
@@ -178,6 +184,7 @@ pub fn default_governance_config() -> GovernanceConfig {
         quorum_threshold: 1_000,
         approval_threshold: 5_000,
         execution_delay: 0,
+        discussion_duration: 0,
     }
 }
 
@@ -262,6 +269,8 @@ pub fn create_proposal(
     if title.is_empty() || description.is_empty() {
         return Err(GovernanceError::InvalidProposal);
     }
+    sanitize_string(env, &title, 256).map_err(|_| GovernanceError::InvalidProposal)?;
+    sanitize_string(env, &description, 4096).map_err(|_| GovernanceError::InvalidProposal)?;
 
     let config = get_governance_config(env);
     let power = get_effective_voting_power(env, &proposer);
@@ -296,6 +305,12 @@ pub fn create_proposal(
     put_vote_snapshots(env, id, &snapshots);
     let now = env.ledger().timestamp();
 
+    let discussion_ends_at = if config.discussion_duration > 0 {
+        now.saturating_add(config.discussion_duration)
+    } else {
+        0
+    };
+
     let proposal = Proposal {
         id,
         proposer: proposer.clone(),
@@ -314,6 +329,7 @@ pub fn create_proposal(
         voters: Map::new(env),
         voter_list: Vec::new(env),
         executed_at: None,
+        discussion_ends_at,
         category,
         use_quadratic_voting,
         quadratic_total_supply,
@@ -327,7 +343,13 @@ pub fn create_proposal(
     #[allow(deprecated)]
     env.events().publish(
         (symbol_short!("gov"), symbol_short!("propnew")),
-        (id, proposer, proposal.voting_starts, proposal.voting_ends),
+        (
+            id,
+            proposer,
+            proposal.discussion_ends_at,
+            proposal.voting_starts,
+            proposal.voting_ends,
+        ),
     );
 
     Ok(id)
@@ -359,6 +381,21 @@ pub fn cast_vote(
     voter.require_auth();
     let mut proposal = get_proposal(env, proposal_id)?;
     let now = env.ledger().timestamp();
+
+    // ── #667: Enforce discussion period ──────────────────────────────────────
+    if proposal.discussion_ends_at > 0 && now < proposal.discussion_ends_at {
+        return Err(GovernanceError::DiscussionPeriodActive);
+    }
+
+    // Emit a one-time event when the proposal first transitions out of the
+    // discussion phase (voter_list is still empty on the first accepted vote).
+    if proposal.discussion_ends_at > 0 && proposal.voter_list.is_empty() {
+        #[allow(deprecated)]
+        env.events().publish(
+            (symbol_short!("gov"), symbol_short!("discend")),
+            (proposal_id, proposal.discussion_ends_at, now),
+        );
+    }
 
     if now < proposal.voting_starts {
         return Err(GovernanceError::VotingNotStarted);
