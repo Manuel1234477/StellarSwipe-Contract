@@ -149,6 +149,15 @@ pub struct Position {
     pub realized_pnl: i128,
 }
 
+/// A single cost lot used for FIFO P&L tracking.
+/// Lots are enqueued via `add_cost_lot` and consumed front-first by `close_fifo`.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CostLot {
+    pub entry_price: i128,
+    pub amount: i128,
+}
+
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TradeHistoryEntry {
@@ -965,6 +974,83 @@ impl UserPortfolio {
     /// positions, in basis points (0 = fully diversified, 10 000 = single position).
     pub fn get_concentration_score(env: Env, user: Address) -> u32 {
         compute_concentration_score(&env, &user)
+    }
+
+    // ── FIFO cost-basis tracking ──────────────────────────────────────────────
+
+    /// Enqueue a cost lot for `user` at the back of their FIFO queue.
+    /// Lots are consumed front-first by `close_fifo`.
+    pub fn add_cost_lot(env: Env, user: Address, entry_price: i128, amount: i128) {
+        user.require_auth();
+        if entry_price <= 0 || amount <= 0 {
+            panic!("invalid entry_price or amount");
+        }
+        let key = DataKey::UserFifoLots(user.clone());
+        let mut lots: Vec<CostLot> = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or_else(|| Vec::new(&env));
+        lots.push_back(CostLot { entry_price, amount });
+        env.storage().persistent().set(&key, &lots);
+    }
+
+    /// Close `close_amount` units at `exit_price` using FIFO lot consumption.
+    /// Panics if there are insufficient lots to satisfy `close_amount`.
+    /// Returns the realized P&L for this operation and accumulates it in storage.
+    pub fn close_fifo(env: Env, user: Address, close_amount: i128, exit_price: i128) -> i128 {
+        user.require_auth();
+        if close_amount <= 0 || exit_price <= 0 {
+            panic!("invalid close_amount or exit_price");
+        }
+
+        let lot_key = DataKey::UserFifoLots(user.clone());
+        let lots: Vec<CostLot> = env
+            .storage()
+            .persistent()
+            .get(&lot_key)
+            .unwrap_or_else(|| Vec::new(&env));
+
+        let mut remaining = close_amount;
+        let mut total_pnl: i128 = 0;
+        let mut new_lots: Vec<CostLot> = Vec::new(&env);
+
+        for i in 0..lots.len() {
+            let Some(lot) = lots.get(i) else { continue };
+            if remaining <= 0 {
+                new_lots.push_back(lot);
+                continue;
+            }
+            let consumed = if lot.amount <= remaining { lot.amount } else { remaining };
+            if lot.entry_price > 0 {
+                // realized = (exit_price - entry_price) * consumed / entry_price
+                let pnl = exit_price
+                    .checked_sub(lot.entry_price)
+                    .and_then(|d| d.checked_mul(consumed))
+                    .and_then(|p| p.checked_div(lot.entry_price))
+                    .unwrap_or(0);
+                total_pnl = total_pnl.saturating_add(pnl);
+            }
+            remaining = remaining.saturating_sub(consumed);
+            let leftover = lot.amount.saturating_sub(consumed);
+            if leftover > 0 {
+                new_lots.push_back(CostLot { entry_price: lot.entry_price, amount: leftover });
+            }
+        }
+
+        if remaining > 0 {
+            panic!("insufficient lots to close requested amount");
+        }
+
+        env.storage().persistent().set(&lot_key, &new_lots);
+
+        let pnl_key = DataKey::UserFifoRealizedPnl(user.clone());
+        let prev: i128 = env.storage().persistent().get(&pnl_key).unwrap_or(0);
+        env.storage()
+            .persistent()
+            .set(&pnl_key, &prev.saturating_add(total_pnl));
+
+        total_pnl
     }
 
     fn require_admin(env: &Env) {
