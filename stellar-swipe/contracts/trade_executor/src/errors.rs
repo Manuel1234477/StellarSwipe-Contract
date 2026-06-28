@@ -53,6 +53,12 @@ pub enum ContractError {
     /// for available liquidity and required amount. Try again later or reduce trade size.
     InsufficientLiquidity = 21,
     CircuitBreakerActive = 22,
+    /// The requested feature is administratively disabled via the feature flag registry.
+    FeatureDisabled = 23,
+    /// A replayed transaction was detected (nonce mismatch, duplicate hash, or expired).
+    ReplayDetected = 24,
+    /// Trade amount is below the configured per-asset minimum (dust-amount griefing guard).
+    BelowMinimumTradeSize = 25,
 }
 
 /// Populated when [`ContractError::InsufficientLiquidity`] is returned.

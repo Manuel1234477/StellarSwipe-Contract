@@ -2,8 +2,9 @@
 
 use crate::errors::OracleError;
 use crate::storage::{get_base_currency, get_price};
+use shared::math::normalize_amount;
 use soroban_sdk::{contracttype, vec, Env, Map, Vec};
-use stellar_swipe_common::{Asset, AssetPair, STELLAR_AMOUNT_SCALE};
+use stellar_swipe_common::{Asset, AssetPair};
 
 const MAX_PATH_LENGTH: u32 = 3;
 
@@ -32,6 +33,11 @@ pub fn convert_to_base(env: &Env, amount: i128, asset: Asset) -> Result<i128, Or
 }
 
 /// Direct conversion: asset → base
+///
+/// `price` is expressed in 7-decimal fixed-point (Stellar standard), so the
+/// product `amount × price` carries 14 implicit decimals.  We use
+/// `shared::math::normalize_amount` to scale it back down to 7 decimals
+/// (truncating toward zero) instead of a bare division by a magic constant.
 fn convert_direct(env: &Env, amount: i128, from: &Asset, to: &Asset) -> Result<i128, OracleError> {
     let pair = AssetPair {
         base: from.clone(),
@@ -39,10 +45,13 @@ fn convert_direct(env: &Env, amount: i128, from: &Asset, to: &Asset) -> Result<i
     };
     let price = get_price(env, &pair)?;
 
-    Ok(amount
+    let product = amount
         .checked_mul(price)
-        .and_then(|v| v.checked_div(STELLAR_AMOUNT_SCALE))
-        .ok_or(OracleError::ConversionOverflow)?)
+        .ok_or(OracleError::ConversionOverflow)?;
+
+    // Product has 14 implicit decimals (7 from amount + 7 from price).
+    // Rescale to 7 decimals using the shared utility.
+    normalize_amount(product, 14, 7).ok_or(OracleError::ConversionOverflow)
 }
 
 /// Path-based conversion: asset → intermediate(s) → base
@@ -123,7 +132,7 @@ fn find_conversion_path(
 fn get_available_pairs(env: &Env) -> Vec<AssetPair> {
     let pairs_map = crate::storage::get_available_pairs(env);
     let mut pairs = vec![env];
-    for (pair, _) in pairs_map.iter() {
+    for pair in pairs_map.iter() {
         pairs.push_back(pair);
     }
     pairs
@@ -133,7 +142,7 @@ fn get_available_pairs(env: &Env) -> Vec<AssetPair> {
 mod tests {
     use super::*;
     use crate::storage::{set_base_currency, set_price};
-    use soroban_sdk::{testutils::Address as _, Address, String};
+    use soroban_sdk::{testutils::Address as _, Address, Env, String};
 
     fn xlm(env: &Env) -> Asset {
         Asset {
@@ -149,33 +158,44 @@ mod tests {
         }
     }
 
+    fn with_oracle_contract<F, R>(f: F) -> R
+    where
+        F: FnOnce(&Env) -> R,
+    {
+        let env = Env::default();
+        let contract_id = env.register_contract(None, crate::OracleContract);
+        env.as_contract(&contract_id, || f(&env))
+    }
+
     #[test]
     fn test_convert_same_asset() {
-        let env = Env::default();
-        let xlm = xlm(&env);
-        set_base_currency(&env, xlm.clone());
+        with_oracle_contract(|env| {
+            let xlm = xlm(env);
+            set_base_currency(env, xlm.clone());
 
-        let result = convert_to_base(&env, 1000_0000000, xlm).unwrap();
-        assert_eq!(result, 1000_0000000);
+            let result = convert_to_base(env, 1000_0000000, xlm).unwrap();
+            assert_eq!(result, 1000_0000000);
+        });
     }
 
     #[test]
     fn test_direct_conversion() {
-        let env = Env::default();
-        let xlm = xlm(&env);
-        let usdc = usdc(&env);
+        with_oracle_contract(|env| {
+            let xlm = xlm(env);
+            let usdc = usdc(env);
 
-        set_base_currency(&env, xlm.clone());
+            set_base_currency(env, xlm.clone());
 
-        // 1 USDC = 10 XLM
-        let pair = AssetPair {
-            base: usdc.clone(),
-            quote: xlm.clone(),
-        };
-        set_price(&env, &pair, 10 * STELLAR_AMOUNT_SCALE);
+            // 1 USDC = 10 XLM
+            let pair = AssetPair {
+                base: usdc.clone(),
+                quote: xlm.clone(),
+            };
+            set_price(env, &pair, 10 * 10_000_000i128); // 10 XLM per USDC (7-decimal rate)
 
-        // Convert 100 USDC to XLM
-        let result = convert_to_base(&env, 100_0000000, usdc).unwrap();
-        assert_eq!(result, 1000_0000000); // 100 * 10 = 1000 XLM
+            // Convert 100 USDC to XLM
+            let result = convert_to_base(env, 100_0000000, usdc).unwrap();
+            assert_eq!(result, 1000_0000000); // 100 * 10 = 1000 XLM
+        });
     }
 }

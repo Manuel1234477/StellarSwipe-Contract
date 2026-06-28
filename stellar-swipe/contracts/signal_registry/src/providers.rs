@@ -1,7 +1,7 @@
-use soroban_sdk::{contracttype, Address, Bytes, Env, String, Symbol, Vec};
+use soroban_sdk::{contracttype, Address, Bytes, Env, IntoVal, Map, String, Symbol, Val, Vec};
 
-use crate::types::{ProviderPerformance, Signal, SignalStatus};
 use crate::events;
+use crate::types::{ProviderPerformance, Signal, SignalStatus};
 
 /// Storage key for the banned providers map
 #[contracttype]
@@ -14,6 +14,92 @@ pub enum BanStorageKey {
 pub const GOLD_TIER_STAKE: i128 = 1_000_000_000;
 pub const MIN_CLOSED_SIGNALS: u32 = 20;
 pub const MIN_SUCCESS_RATE_BPS: u32 = 6_000;
+
+// ─── Provider specialization tags (Issue #704) ───────────────────────────────
+
+/// Maximum number of specialization tags a single provider may select.
+pub const MAX_SPECIALIZATION_TAGS_PER_PROVIDER: u32 = 3;
+
+/// Maximum length of a specialization tag string (in bytes).
+pub const MAX_SPECIALIZATION_TAG_LENGTH: u32 = 32;
+
+/// Maximum number of admin-defined specialization tags.
+pub const MAX_ADMIN_SPECIALIZATION_TAGS: u32 = 50;
+
+/// Storage key for provider specialization tags.
+#[contracttype]
+#[derive(Clone)]
+pub enum SpecializationStorageKey {
+    /// Admin-defined set of valid specialization tags.
+    SpecializationTags,
+    /// Per-provider: the list of specialization tags they self-selected.
+    /// Stored as `Vec<String>`.
+    ProviderSpecializations(Address),
+    /// Reverse index: tag -> Vec<Address> of providers with that tag.
+    ProvidersBySpecialization(soroban_sdk::String),
+}
+
+/// Add a specialization tag to the admin-defined set.
+pub fn add_specialization_tag(env: &Env, admin: &Address, tag: String) -> Result<(), ()> {
+    admin.require_auth();
+    if tag.len() == 0 || tag.len() > MAX_SPECIALIZATION_TAG_LENGTH {
+        panic!("tag length out of bounds");
+    }
+
+    let mut tags: soroban_sdk::Vec<String> = env
+        .storage()
+        .instance()
+        .get(&SpecializationStorageKey::SpecializationTags)
+        .unwrap_or_else(|| soroban_sdk::Vec::new(env));
+
+    for i in 0..tags.len() {
+        if let Some(t) = tags.get(i) {
+            if t == tag {
+                return Ok(());
+            }
+        }
+    }
+
+    if tags.len() >= MAX_ADMIN_SPECIALIZATION_TAGS {
+        panic!("max specialization tags reached");
+    }
+
+    tags.push_back(tag);
+    env.storage()
+        .instance()
+        .set(&SpecializationStorageKey::SpecializationTags, &tags);
+    Ok(())
+}
+
+/// Remove a specialization tag from the admin-defined set.
+pub fn remove_specialization_tag(env: &Env, admin: &Address, tag: String) {
+    admin.require_auth();
+    let mut tags: soroban_sdk::Vec<String> = env
+        .storage()
+        .instance()
+        .get(&SpecializationStorageKey::SpecializationTags)
+        .unwrap_or_else(|| soroban_sdk::Vec::new(env));
+
+    let mut updated = soroban_sdk::Vec::new(env);
+    for i in 0..tags.len() {
+        if let Some(t) = tags.get(i) {
+            if t != tag {
+                updated.push_back(t);
+            }
+        }
+    }
+    env.storage()
+        .instance()
+        .set(&SpecializationStorageKey::SpecializationTags, &updated);
+}
+
+/// Returns the admin-defined set of specialization tags.
+pub fn get_specialization_tags(env: &Env) -> soroban_sdk::Vec<String> {
+    env.storage()
+        .instance()
+        .get(&SpecializationStorageKey::SpecializationTags)
+        .unwrap_or_else(|| soroban_sdk::Vec::new(env))
+}
 
 // ─── Provider Profile (Task 3) ────────────────────────────────────────────────
 
@@ -153,11 +239,7 @@ where
 {
     // Prevent duplicate pending appeals.
     let key = ProviderStorageKey::BanAppeal(provider.clone());
-    if let Some(existing) = env
-        .storage()
-        .persistent()
-        .get::<_, BanAppeal>(&key)
-    {
+    if let Some(existing) = env.storage().persistent().get::<_, BanAppeal>(&key) {
         if existing.status == AppealStatus::Pending {
             return Err(AppealError::AppealAlreadyPending);
         }
@@ -176,8 +258,7 @@ where
     env.storage().persistent().set(&key, &appeal);
 
     let topics = (Symbol::new(env, "ban_appeal_submitted"),);
-    env.events()
-        .publish(topics, (provider, proposal_id));
+    env.events().publish(topics, (provider, proposal_id));
 
     Ok(appeal)
 }
@@ -186,11 +267,7 @@ where
 ///
 /// Restores the provider's `verified` flag in their profile and emits `BanReversed`.
 /// `return_stake_fn` is injected to handle stake return logic.
-pub fn reverse_ban<F>(
-    env: &Env,
-    provider: Address,
-    return_stake_fn: F,
-) -> Result<(), AppealError>
+pub fn reverse_ban<F>(env: &Env, provider: Address, return_stake_fn: F) -> Result<(), AppealError>
 where
     F: Fn(&Env, &Address) -> Result<(), AppealError>,
 {
@@ -309,8 +386,127 @@ pub fn check_verification_eligibility(
     }
 }
 
-// ═══════════════════════════════════════════════════════════════════
-// Issue #424: Provider Ban Mechanism
+/// Set the specialization tags for a provider (self-selected).
+/// Replaces any existing tags for this provider.
+/// Validates that all tags are in the admin-defined set and within count limits.
+pub fn set_provider_specializations(
+    env: &Env,
+    provider: &Address,
+    tags: soroban_sdk::Vec<String>,
+) {
+    provider.require_auth();
+
+    if tags.len() > MAX_SPECIALIZATION_TAGS_PER_PROVIDER {
+        panic!("provider may select at most {MAX_SPECIALIZATION_TAGS_PER_PROVIDER} specialization tags");
+    }
+
+    let valid_tags: soroban_sdk::Vec<String> = env
+        .storage()
+        .instance()
+        .get(&SpecializationStorageKey::SpecializationTags)
+        .unwrap_or_else(|| soroban_sdk::Vec::new(env));
+
+    for i in 0..tags.len() {
+        if let Some(tag) = tags.get(i) {
+            if tag.len() == 0 || tag.len() > MAX_SPECIALIZATION_TAG_LENGTH {
+                panic!("invalid tag length");
+            }
+            let mut found = false;
+            for j in 0..valid_tags.len() {
+                if let Some(vt) = valid_tags.get(j) {
+                    if vt == tag {
+                        found = true;
+                        break;
+                    }
+                }
+            }
+            if !found {
+                panic!("tag is not in the admin-defined set");
+            }
+        }
+    }
+
+    // Remove old reverse index entries.
+    let old_key = SpecializationStorageKey::ProviderSpecializations(provider.clone());
+    if let Some(old_tags) = env
+        .storage()
+        .persistent()
+        .get::<_, soroban_sdk::Vec<String>>(&old_key)
+    {
+        for i in 0..old_tags.len() {
+            if let Some(old_tag) = old_tags.get(i) {
+                let rev_key = SpecializationStorageKey::ProvidersBySpecialization(old_tag);
+                let mut providers: soroban_sdk::Vec<Address> = env
+                    .storage()
+                    .persistent()
+                    .get(&rev_key)
+                    .unwrap_or_else(|| soroban_sdk::Vec::new(env));
+                let mut updated = soroban_sdk::Vec::new(env);
+                for j in 0..providers.len() {
+                    if let Some(p) = providers.get(j) {
+                        if p != *provider {
+                            updated.push_back(p);
+                        }
+                    }
+                }
+                if updated.len() > 0 {
+                    env.storage().persistent().set(&rev_key, &updated);
+                } else {
+                    env.storage().persistent().remove(&rev_key);
+                }
+            }
+        }
+    }
+
+    // Store new tags and update reverse index.
+    env.storage().persistent().set(&old_key, &tags);
+    for i in 0..tags.len() {
+        if let Some(tag) = tags.get(i) {
+            let rev_key = SpecializationStorageKey::ProvidersBySpecialization(tag);
+            let mut providers: soroban_sdk::Vec<Address> = env
+                .storage()
+                .persistent()
+                .get(&rev_key)
+                .unwrap_or_else(|| soroban_sdk::Vec::new(env));
+            let mut already = false;
+            for j in 0..providers.len() {
+                if let Some(p) = providers.get(j) {
+                    if p == *provider {
+                        already = true;
+                        break;
+                    }
+                }
+            }
+            if !already {
+                providers.push_back(provider.clone());
+                env.storage().persistent().set(&rev_key, &providers);
+            }
+        }
+    }
+}
+
+/// Returns the specialization tags for a given provider.
+pub fn get_provider_specializations(
+    env: &Env,
+    provider: &Address,
+) -> soroban_sdk::Vec<String> {
+    env.storage()
+        .persistent()
+        .get(&SpecializationStorageKey::ProviderSpecializations(provider.clone()))
+        .unwrap_or_else(|| soroban_sdk::Vec::new(env))
+}
+
+/// Returns all providers that have selected the given specialization tag.
+pub fn list_providers_by_specialization(
+    env: &Env,
+    tag: soroban_sdk::String,
+) -> soroban_sdk::Vec<Address> {
+    env.storage()
+        .persistent()
+        .get(&SpecializationStorageKey::ProvidersBySpecialization(tag))
+        .unwrap_or_else(|| soroban_sdk::Vec::new(env))
+}
+
 // ═══════════════════════════════════════════════════════════════════
 
 /// Check if a provider is banned (presence of ban reason indicates banned status)
@@ -346,9 +542,10 @@ pub fn ban_provider(
     stake_vault: &Address,
 ) -> (u32, i128) {
     // Mark provider as banned by storing the reason hash
-    env.storage()
-        .persistent()
-        .set(&BanStorageKey::ProviderBanReason(provider.clone()), reason_hash);
+    env.storage().persistent().set(
+        &BanStorageKey::ProviderBanReason(provider.clone()),
+        reason_hash,
+    );
 
     // Cancel all active signals from this provider
     let mut signals_cancelled: u32 = 0;
@@ -365,7 +562,7 @@ pub fn ban_provider(
     }
 
     // Slash full stake via cross-contract call to StakeVault
-    let stake_slashed = Self::slash_stake(env, provider, stake_vault);
+    let stake_slashed = slash_stake(env, provider, stake_vault);
 
     (signals_cancelled, stake_slashed)
 }
@@ -375,9 +572,7 @@ fn slash_stake(env: &Env, provider: &Address, stake_vault: &Address) -> i128 {
     let sym = soroban_sdk::Symbol::new(env, "get_stake");
     let mut args = soroban_sdk::Vec::<soroban_sdk::Val>::new(env);
     args.push_back(provider.clone().into_val(env));
-    let stake: i128 = env
-        .invoke_contract(stake_vault, &sym, args)
-        .unwrap_or(0);
+    let stake: i128 = env.invoke_contract(stake_vault, &sym, args);
 
     if stake > 0 {
         // Call slash_stake on StakeVault — pass this contract as caller (authorizes the slash),
@@ -390,7 +585,7 @@ fn slash_stake(env: &Env, provider: &Address, stake_vault: &Address) -> i128 {
         slash_args.push_back(stake.into_val(env));
         let reason = soroban_sdk::Symbol::new(env, "ban");
         slash_args.push_back(reason.into_val(env));
-        let _ = env.try_invoke_contract::<()>(stake_vault, &slash_sym, slash_args);
+        let _ = env.invoke_contract::<()>(stake_vault, &slash_sym, slash_args);
     }
 
     stake
@@ -408,8 +603,10 @@ pub fn emit_provider_banned(
         soroban_sdk::Symbol::new(env, "provider_banned"),
         provider.clone(),
     );
-    env.events()
-        .publish(topics, (reason_hash.clone(), signals_cancelled, stake_slashed));
+    env.events().publish(
+        topics,
+        (reason_hash.clone(), signals_cancelled, stake_slashed),
+    );
 }
 
 #[cfg(test)]
@@ -433,81 +630,91 @@ mod tests {
 
     // ── Profile tests ──────────────────────────────────────────────────────
 
+    fn with_contract<R>(f: impl FnOnce(&Env) -> R) -> R {
+        let env = Env::default();
+        #[allow(deprecated)]
+        let cid = env.register_contract(None, crate::SignalRegistry);
+        env.as_contract(&cid, || f(&env))
+    }
+
     #[test]
     fn profile_created_on_first_stake() {
-        let env = Env::default();
-        let provider = Address::generate(&env);
-        let s = stats(25, 7_000);
+        with_contract(|env| {
+            let provider = Address::generate(&env);
+            let s = stats(25, 7_000);
 
-        let profile = create_or_update_provider_profile(
-            &env,
-            provider.clone(),
-            String::from_str(&env, "abc123"),
-            String::from_str(&env, "bio456"),
-            &s,
-            GOLD_TIER_STAKE,
-            false,
-        );
+            let profile = create_or_update_provider_profile(
+                &env,
+                provider.clone(),
+                String::from_str(&env, "abc123"),
+                String::from_str(&env, "bio456"),
+                &s,
+                GOLD_TIER_STAKE,
+                false,
+            );
 
-        assert_eq!(profile.total_signals, 25);
-        assert_eq!(profile.stake_tier, 3);
-        assert!(!profile.verified);
+            assert_eq!(profile.total_signals, 25);
+            assert_eq!(profile.stake_tier, 3);
+            assert!(!profile.verified);
 
-        let stored = get_provider_profile(&env, &provider).unwrap();
-        assert_eq!(stored.display_name_hash, String::from_str(&env, "abc123"));
+            let stored = get_provider_profile(&env, &provider).unwrap();
+            assert_eq!(stored.display_name_hash, String::from_str(&env, "abc123"));
+        });
     }
 
     #[test]
     fn profile_update_preserves_created_at() {
-        let env = Env::default();
-        let provider = Address::generate(&env);
-        let s = stats(10, 5_000);
+        with_contract(|env| {
+            let provider = Address::generate(&env);
+            let s = stats(10, 5_000);
 
-        let first = create_or_update_provider_profile(
-            &env,
-            provider.clone(),
-            String::from_str(&env, "hash1"),
-            String::from_str(&env, "bio1"),
-            &s,
-            0,
-            false,
-        );
+            let first = create_or_update_provider_profile(
+                &env,
+                provider.clone(),
+                String::from_str(&env, "hash1"),
+                String::from_str(&env, "bio1"),
+                &s,
+                0,
+                false,
+            );
 
-        let second = create_or_update_provider_profile(
-            &env,
-            provider.clone(),
-            String::from_str(&env, "hash2"),
-            String::from_str(&env, "bio2"),
-            &s,
-            0,
-            true,
-        );
+            let second = create_or_update_provider_profile(
+                &env,
+                provider.clone(),
+                String::from_str(&env, "hash2"),
+                String::from_str(&env, "bio2"),
+                &s,
+                0,
+                true,
+            );
 
-        assert_eq!(first.created_at, second.created_at);
-        assert_eq!(second.display_name_hash, String::from_str(&env, "hash2"));
-        assert!(second.verified);
+            assert_eq!(first.created_at, second.created_at);
+            assert_eq!(second.display_name_hash, String::from_str(&env, "hash2"));
+            assert!(second.verified);
+        });
     }
 
     #[test]
     fn profile_readable_by_anyone() {
-        let env = Env::default();
-        let provider = Address::generate(&env);
-        let s = stats(5, 4_000);
+        with_contract(|env| {
+            let provider = Address::generate(&env);
+            let s = stats(5, 4_000);
 
-        create_or_update_provider_profile(
-            &env,
-            provider.clone(),
-            String::from_str(&env, "h"),
-            String::from_str(&env, "b"),
-            &s,
-            0,
-            false,
-        );
+            create_or_update_provider_profile(
+                &env,
+                provider.clone(),
+                String::from_str(&env, "h"),
+                String::from_str(&env, "b"),
+                &s,
+                0,
+                false,
+            );
 
-        // Any address can read
-        let reader = Address::generate(&env);
-        let _ = reader; // just to show it's a different address
-        assert!(get_provider_profile(&env, &provider).is_some());
+            // Any address can read
+            let reader = Address::generate(&env);
+            let _ = reader;
+            assert!(get_provider_profile(&env, &provider).is_some());
+        });
     }
 
     // ── Appeal tests ───────────────────────────────────────────────────────
@@ -526,72 +733,80 @@ mod tests {
 
     #[test]
     fn appeal_submission_creates_governance_proposal() {
-        let env = Env::default();
-        let provider = Address::generate(&env);
-        let evidence = Bytes::from_slice(&env, b"ipfs://evidence");
+        with_contract(|env| {
+            let provider = Address::generate(&env);
+            let evidence = Bytes::from_slice(&env, b"ipfs://evidence");
 
-        let appeal =
-            submit_ban_appeal(&env, provider.clone(), evidence, stub_create_proposal).unwrap();
+            let appeal =
+                submit_ban_appeal(&env, provider.clone(), evidence, stub_create_proposal).unwrap();
 
-        assert_eq!(appeal.governance_proposal_id, 42);
-        assert_eq!(appeal.status, AppealStatus::Pending);
+            assert_eq!(appeal.governance_proposal_id, 42);
+            assert_eq!(appeal.status, AppealStatus::Pending);
 
-        let stored = get_ban_appeal(&env, &provider).unwrap();
-        assert_eq!(stored.governance_proposal_id, 42);
+            let stored = get_ban_appeal(&env, &provider).unwrap();
+            assert_eq!(stored.governance_proposal_id, 42);
+        });
     }
 
     #[test]
     fn governance_reversal_restores_provider_status_and_stake() {
-        let env = Env::default();
-        let provider = Address::generate(&env);
-        let evidence = Bytes::from_slice(&env, b"ipfs://evidence");
+        with_contract(|env| {
+            let provider = Address::generate(&env);
+            let evidence = Bytes::from_slice(&env, b"ipfs://evidence");
 
-        // Create profile first
-        let s = stats(25, 7_000);
-        create_or_update_provider_profile(
-            &env,
-            provider.clone(),
-            String::from_str(&env, "h"),
-            String::from_str(&env, "b"),
-            &s,
-            GOLD_TIER_STAKE,
-            false, // banned → verified=false
-        );
+            // Create profile first
+            let s = stats(25, 7_000);
+            create_or_update_provider_profile(
+                &env,
+                provider.clone(),
+                String::from_str(&env, "h"),
+                String::from_str(&env, "b"),
+                &s,
+                GOLD_TIER_STAKE,
+                false, // banned → verified=false
+            );
 
-        submit_ban_appeal(&env, provider.clone(), evidence, stub_create_proposal).unwrap();
-        reverse_ban(&env, provider.clone(), stub_return_stake).unwrap();
+            submit_ban_appeal(&env, provider.clone(), evidence, stub_create_proposal).unwrap();
+            reverse_ban(&env, provider.clone(), stub_return_stake).unwrap();
 
-        let appeal = get_ban_appeal(&env, &provider).unwrap();
-        assert_eq!(appeal.status, AppealStatus::Approved);
+            let appeal = get_ban_appeal(&env, &provider).unwrap();
+            assert_eq!(appeal.status, AppealStatus::Approved);
 
-        let profile = get_provider_profile(&env, &provider).unwrap();
-        assert!(profile.verified);
+            let profile = get_provider_profile(&env, &provider).unwrap();
+            assert!(profile.verified);
+        });
     }
 
     #[test]
     fn governance_rejection_sets_rejected_status() {
-        let env = Env::default();
-        let provider = Address::generate(&env);
-        let evidence = Bytes::from_slice(&env, b"ipfs://evidence");
+        with_contract(|env| {
+            let provider = Address::generate(&env);
+            let evidence = Bytes::from_slice(&env, b"ipfs://evidence");
 
-        submit_ban_appeal(&env, provider.clone(), evidence, stub_create_proposal).unwrap();
-        reject_ban_appeal(&env, provider.clone()).unwrap();
+            submit_ban_appeal(&env, provider.clone(), evidence, stub_create_proposal).unwrap();
+            reject_ban_appeal(&env, provider.clone()).unwrap();
 
-        let appeal = get_ban_appeal(&env, &provider).unwrap();
-        assert_eq!(appeal.status, AppealStatus::Rejected);
+            let appeal = get_ban_appeal(&env, &provider).unwrap();
+            assert_eq!(appeal.status, AppealStatus::Rejected);
+        });
     }
 
     #[test]
     fn duplicate_pending_appeal_rejected() {
-        let env = Env::default();
-        let provider = Address::generate(&env);
-        let evidence = Bytes::from_slice(&env, b"ipfs://evidence");
+        with_contract(|env| {
+            let provider = Address::generate(&env);
+            let evidence = Bytes::from_slice(&env, b"ipfs://evidence");
 
-        submit_ban_appeal(&env, provider.clone(), evidence.clone(), stub_create_proposal)
+            submit_ban_appeal(
+                &env,
+                provider.clone(),
+                evidence.clone(),
+                stub_create_proposal,
+            )
             .unwrap();
-        let result =
-            submit_ban_appeal(&env, provider.clone(), evidence, stub_create_proposal);
-        assert_eq!(result, Err(AppealError::AppealAlreadyPending));
+            let result = submit_ban_appeal(&env, provider.clone(), evidence, stub_create_proposal);
+            assert_eq!(result, Err(AppealError::AppealAlreadyPending));
+        });
     }
 
     // ── Existing eligibility tests ─────────────────────────────────────────
@@ -646,5 +861,130 @@ mod tests {
         assert!(!eligibility.history_ok);
         assert!(!eligibility.success_rate_ok);
         assert_eq!(eligibility.missing_criteria.len(), 3);
+    }
+
+    // ── Provider specialization tag tests (Issue #704) ──────────────────────
+
+    #[test]
+    fn add_and_list_specialization_tags() {
+        with_contract(|env| {
+            let admin = Address::generate(env);
+            let provider1 = Address::generate(env);
+            let provider2 = Address::generate(env);
+
+            // Add admin-defined tags
+            add_specialization_tag(env, &admin, String::from_str(env, "DeFi")).unwrap();
+            add_specialization_tag(env, &admin, String::from_str(env, "Forex")).unwrap();
+
+            let tags = get_specialization_tags(env);
+            assert_eq!(tags.len(), 2);
+
+            // Set provider specializations
+            let mut p1_tags = soroban_sdk::Vec::new(env);
+            p1_tags.push_back(String::from_str(env, "DeFi"));
+            set_provider_specializations(env, &provider1, p1_tags);
+
+            let mut p2_tags = soroban_sdk::Vec::new(env);
+            p2_tags.push_back(String::from_str(env, "Forex"));
+            set_provider_specializations(env, &provider2, p2_tags);
+
+            // List by tag
+            let defi_providers = list_providers_by_specialization(env, String::from_str(env, "DeFi"));
+            assert_eq!(defi_providers.len(), 1);
+            assert_eq!(defi_providers.get(0).unwrap(), provider1);
+        });
+    }
+
+    #[test]
+    fn tag_count_limit_enforced() {
+        with_contract(|env| {
+            let admin = Address::generate(env);
+            let provider = Address::generate(env);
+
+            add_specialization_tag(env, &admin, String::from_str(env, "DeFi")).unwrap();
+            add_specialization_tag(env, &admin, String::from_str(env, "Forex")).unwrap();
+            add_specialization_tag(env, &admin, String::from_str(env, "Large-cap")).unwrap();
+            add_specialization_tag(env, &admin, String::from_str(env, "Crypto")).unwrap();
+
+            // Try to set 4 tags (limit is 3)
+            let mut tags = soroban_sdk::Vec::new(env);
+            tags.push_back(String::from_str(env, "DeFi"));
+            tags.push_back(String::from_str(env, "Forex"));
+            tags.push_back(String::from_str(env, "Large-cap"));
+            tags.push_back(String::from_str(env, "Crypto"));
+
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                set_provider_specializations(env, &provider, tags);
+            }));
+            assert!(result.is_err());
+        });
+    }
+
+    #[test]
+    fn unknown_tag_rejected() {
+        with_contract(|env| {
+            let admin = Address::generate(env);
+            let provider = Address::generate(env);
+
+            add_specialization_tag(env, &admin, String::from_str(env, "DeFi")).unwrap();
+
+            let mut tags = soroban_sdk::Vec::new(env);
+            tags.push_back(String::from_str(env, "UnknownTag"));
+
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                set_provider_specializations(env, &provider, tags);
+            }));
+            assert!(result.is_err());
+        });
+    }
+
+    #[test]
+    fn provider_can_retag() {
+        with_contract(|env| {
+            let admin = Address::generate(env);
+            let provider = Address::generate(env);
+
+            add_specialization_tag(env, &admin, String::from_str(env, "DeFi")).unwrap();
+            add_specialization_tag(env, &admin, String::from_str(env, "Forex")).unwrap();
+
+            let mut tags1 = soroban_sdk::Vec::new(env);
+            tags1.push_back(String::from_str(env, "DeFi"));
+            set_provider_specializations(env, &provider, tags1);
+
+            let stored1 = get_provider_specializations(env, &provider);
+            assert_eq!(stored1.len(), 1);
+            assert_eq!(stored1.get(0).unwrap(), String::from_str(env, "DeFi"));
+
+            // Retag
+            let mut tags2 = soroban_sdk::Vec::new(env);
+            tags2.push_back(String::from_str(env, "Forex"));
+            set_provider_specializations(env, &provider, tags2);
+
+            let stored2 = get_provider_specializations(env, &provider);
+            assert_eq!(stored2.len(), 1);
+            assert_eq!(stored2.get(0).unwrap(), String::from_str(env, "Forex"));
+
+            // Old tag should no longer list the provider
+            let defi_providers = list_providers_by_specialization(env, String::from_str(env, "DeFi"));
+            assert_eq!(defi_providers.len(), 0);
+        });
+    }
+
+    #[test]
+    fn remove_specialization_tag_works() {
+        with_contract(|env| {
+            let admin = Address::generate(env);
+
+            add_specialization_tag(env, &admin, String::from_str(env, "DeFi")).unwrap();
+            add_specialization_tag(env, &admin, String::from_str(env, "Forex")).unwrap();
+
+            assert_eq!(get_specialization_tags(env).len(), 2);
+
+            remove_specialization_tag(env, &admin, String::from_str(env, "DeFi"));
+
+            let remaining = get_specialization_tags(env);
+            assert_eq!(remaining.len(), 1);
+            assert_eq!(remaining.get(0).unwrap(), String::from_str(env, "Forex"));
+        });
     }
 }

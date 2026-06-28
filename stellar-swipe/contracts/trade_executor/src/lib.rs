@@ -1,7 +1,8 @@
 #![no_std]
 
-mod errors;
 pub mod dca;
+mod errors;
+pub mod feature_flags;
 pub mod keeper;
 mod oracle;
 pub mod risk_gates;
@@ -11,13 +12,18 @@ pub mod triggers;
 mod wire;
 
 use errors::{ContractError, InsufficientBalanceDetail, NetworkErrorDetail};
+use shared::math::normalize_amount;
 use risk_gates::{
     check_user_balance, resolve_trade_amount, validate_and_record_position,
-    DEFAULT_ESTIMATED_COPY_TRADE_FEE, MAX_BATCH_SIZE,
+    validate_min_trade_size, DEFAULT_ESTIMATED_COPY_TRADE_FEE, DEFAULT_MIN_TRADE_SIZE,
+    MAX_BATCH_SIZE,
 };
 use sdex::{execute_sdex_swap, min_received_from_slippage};
-use soroban_sdk::{contract, contractimpl, contracttype, Address, Env, IntoVal, Symbol, Val, Vec};
+use soroban_sdk::{
+    contract, contractimpl, contracttype, Address, Bytes, Env, IntoVal, String, Symbol, Val, Vec,
+};
 
+use stellar_swipe_common::replay_protection::verify_and_commit;
 use triggers::{ORACLE_KEY, PORTFOLIO_KEY};
 use wire::TRADE_TIMEOUT_LEDGERS;
 
@@ -60,15 +66,19 @@ pub enum StorageKey {
     CircuitBreakerLedger,
     MaxOpenInterestPerPair,
     OpenInterestPerPair(Address),
-    /// Priority-lane configuration for high-stake vs standard followers (Issue #682).
-    PriorityConfig,
-    /// Consecutive priority-only batch counter for fairness fallback (Issue #682).
-    PriorityBatchCounter,
+    /// Feature flag: keyed by flag name. `true` = enabled, absent/`false` = disabled.
+    FeatureFlag(String),
+    /// Per-asset minimum trade size override (absent = use [`DEFAULT_MIN_TRADE_SIZE`]).
+    MinTradeSize(Address),
 }
 
 /// Temporary-storage key for the reentrancy lock on `execute_copy_trade`.
 const EXECUTION_LOCK: &str = "ExecLock";
 pub const CIRCUIT_BREAKER_DURATION_LEDGERS: u32 = 720;
+
+/// Denominator used to convert `entry_price * amount` into `to_token` units.
+/// Entry prices are expected to be in 7‑decimal format (e.g. 10_000_000 = 1.0).
+const ENTRY_PRICE_DENOMINATOR: i128 = 10_000_000;
 
 /// A single trade input for [`TradeExecutorContract::batch_execute`].
 #[contracttype]
@@ -87,6 +97,33 @@ pub struct BatchTradeResult {
     pub ok: bool,
     /// `ContractError` discriminant when `ok == false`; 0 when `ok == true`.
     pub error_code: u32,
+}
+
+/// Instance config hoisted once per `batch_execute` call to amortize storage reads.
+#[derive(Clone)]
+struct BatchExecutionContext {
+    portfolio: Address,
+    estimated_fee: i128,
+    daily_limit: i128,
+    circuit_breaker_active: bool,
+}
+
+fn prepare_batch_context(env: &Env) -> Result<BatchExecutionContext, ContractError> {
+    let portfolio = env
+        .storage()
+        .instance()
+        .get(&StorageKey::UserPortfolio)
+        .ok_or(ContractError::NotInitialized)?;
+    Ok(BatchExecutionContext {
+        portfolio,
+        estimated_fee: effective_estimated_fee(env),
+        daily_limit: env
+            .storage()
+            .instance()
+            .get(&StorageKey::DailyVolumeLimit)
+            .unwrap_or(0i128),
+        circuit_breaker_active: market_circuit_breaker_active(env),
+    })
 }
 
 #[contracttype]
@@ -109,6 +146,16 @@ pub fn rebalance_portfolio(_user: u32, targets: Vec<AllocationTarget>) {
 pub enum OrderType {
     Market,
     Limit,
+}
+
+/// Replay-protection trio, bundled into one struct so contract entrypoints with
+/// several other arguments stay under Soroban's 10-parameter function limit.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReplayParams {
+    pub nonce: u64,
+    pub tx_hash: Bytes,
+    pub expiry_ts: u64,
 }
 
 #[contracttype]
@@ -135,6 +182,15 @@ fn effective_estimated_fee(env: &Env) -> i128 {
 
 fn require_admin(env: &Env) -> Result<Address, ContractError> {
     oracle::require_admin(env)
+}
+
+/// Effective per-asset minimum trade size: the admin-configured override for `token`,
+/// or [`DEFAULT_MIN_TRADE_SIZE`] when no override has been set.
+fn effective_min_trade_size(env: &Env, token: &Address) -> i128 {
+    env.storage()
+        .instance()
+        .get(&StorageKey::MinTradeSize(token.clone()))
+        .unwrap_or(DEFAULT_MIN_TRADE_SIZE)
 }
 
 #[contracttype]
@@ -257,6 +313,7 @@ fn execute_market_copy_trade(
     amount: i128,
     portfolio_pct_bps: Option<u32>,
     require_user_auth: bool,
+    batch_ctx: Option<&BatchExecutionContext>,
 ) -> Result<(), ContractError> {
     if require_user_auth {
         user.require_auth();
@@ -265,8 +322,12 @@ fn execute_market_copy_trade(
     if amount <= 0 {
         return Err(ContractError::InvalidAmount);
     }
+    validate_min_trade_size(amount, effective_min_trade_size(env, &token))?;
 
-    if market_circuit_breaker_active(env) {
+    let cb_active = batch_ctx
+        .map(|c| c.circuit_breaker_active)
+        .unwrap_or_else(|| market_circuit_breaker_active(env));
+    if cb_active {
         return Err(ContractError::CircuitBreakerActive);
     }
     check_open_interest_limit(env, &token, amount)?;
@@ -284,11 +345,12 @@ fn execute_market_copy_trade(
     env.storage().temporary().set(&lock_key, &true);
 
     // ── Daily volume limit check ───────────────────────────────────────────
-    let limit: i128 = env
-        .storage()
-        .instance()
-        .get(&StorageKey::DailyVolumeLimit)
-        .unwrap_or(0i128);
+    let limit = batch_ctx.map(|c| c.daily_limit).unwrap_or_else(|| {
+        env.storage()
+            .instance()
+            .get(&StorageKey::DailyVolumeLimit)
+            .unwrap_or(0i128)
+    });
     if limit > 0 {
         let today: u64 = env.ledger().timestamp() / 86_400;
         let day_key = StorageKey::DailyVolumeDay(user.clone());
@@ -309,12 +371,15 @@ fn execute_market_copy_trade(
     }
 
     // ── Read cached config from instance storage (no cross-contract call) ─
-    let portfolio: Address = match env.storage().instance().get(&StorageKey::UserPortfolio) {
-        Some(portfolio) => portfolio,
-        None => {
-            env.storage().temporary().remove(&lock_key);
-            return Err(ContractError::NotInitialized);
-        }
+    let portfolio: Address = match batch_ctx.map(|c| c.portfolio.clone()) {
+        Some(p) => p,
+        None => match env.storage().instance().get(&StorageKey::UserPortfolio) {
+            Some(portfolio) => portfolio,
+            None => {
+                env.storage().temporary().remove(&lock_key);
+                return Err(ContractError::NotInitialized);
+            }
+        },
     };
 
     let exempt = {
@@ -334,7 +399,9 @@ fn execute_market_copy_trade(
         };
 
     // ── Cross-contract call #1: SEP-41 balance check ──────────────────────
-    let fee = effective_estimated_fee(env);
+    let fee = batch_ctx
+        .map(|c| c.estimated_fee)
+        .unwrap_or_else(|| effective_estimated_fee(env));
     let bal_key = StorageKey::LastInsufficientBalance(user.clone());
     let use_fee_fallback = match check_user_balance(env, &user, &token, effective_amount, fee) {
         Ok(()) => {
@@ -494,6 +561,28 @@ impl TradeExecutorContract {
 
     pub fn get_copy_trade_estimated_fee(env: Env) -> i128 {
         effective_estimated_fee(&env)
+    }
+
+    /// Admin: set the minimum trade size for `token` (dust-amount griefing guard).
+    /// Trades/copy-trades below this amount are rejected before any state changes.
+    pub fn set_min_trade_size(env: Env, token: Address, minimum: i128) {
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&StorageKey::Admin)
+            .expect("not initialized");
+        admin.require_auth();
+        if minimum < 0 {
+            panic!("minimum must be non-negative");
+        }
+        env.storage()
+            .instance()
+            .set(&StorageKey::MinTradeSize(token), &minimum);
+    }
+
+    /// Effective minimum trade size for `token` (override, or [`DEFAULT_MIN_TRADE_SIZE`]).
+    pub fn get_min_trade_size(env: Env, token: Address) -> i128 {
+        effective_min_trade_size(&env, &token)
     }
 
     /// Admin override: exempt `user` from the per-user position cap (or clear exemption).
@@ -677,6 +766,10 @@ impl TradeExecutorContract {
 
     /// Execute a copy trade.
     ///
+    /// Accepts replay-protection parameters (`nonce`, `tx_hash`, `expiry_ts`) so that
+    /// the caller can provide a strictly increasing nonce and a unique transaction hash
+    /// to prevent replay attacks.
+    ///
     /// ## Cross-contract call budget (Issue #306 optimization)
     /// | # | Callee            | Purpose                                      |
     /// |---|-------------------|----------------------------------------------|
@@ -693,10 +786,16 @@ impl TradeExecutorContract {
         portfolio_pct_bps: Option<u32>,
         order_type: OrderType,
         limit_price: Option<i128>,
+        nonce: u64,
+        tx_hash: Bytes,
+        expiry_ts: u64,
     ) -> Result<(), ContractError> {
+        verify_and_commit(&env, &user, nonce, tx_hash, expiry_ts)
+            .map_err(|_| ContractError::ReplayDetected)?;
+        feature_flags::require_feature_enabled(&env, feature_flags::FEAT_COPY_TRADE)?;
         match order_type {
             OrderType::Market => {
-                execute_market_copy_trade(&env, user, token, amount, portfolio_pct_bps, true)
+                execute_market_copy_trade(&env, user, token, amount, portfolio_pct_bps, true, None)
             }
             OrderType::Limit => {
                 user.require_auth();
@@ -707,6 +806,7 @@ impl TradeExecutorContract {
                 if price <= 0 {
                     return Err(ContractError::InvalidAmount);
                 }
+                validate_min_trade_size(amount, effective_min_trade_size(&env, &token))?;
 
                 let fee = effective_estimated_fee(&env);
                 let bal_key = StorageKey::LastInsufficientBalance(user.clone());
@@ -838,6 +938,7 @@ impl TradeExecutorContract {
                     order.amount,
                     order.portfolio_pct_bps,
                     false,
+                    None,
                 )?;
                 env.storage()
                     .instance()
@@ -976,6 +1077,14 @@ impl TradeExecutorContract {
 
     /// Cancel a copy trade manually: executes a SDEX swap to close the position,
     /// records exit in UserPortfolio, and emits `TradeCancelled`.
+    ///
+    /// `entry_price` is the per-unit price of `from_token` in `to_token` terms at
+    /// entry (scaled by [`ENTRY_PRICE_DENOMINATOR`]).  
+    /// Realized P&L = `exit_price - (amount × entry_price / ENTRY_PRICE_DENOMINATOR)`,
+    /// which expresses both terms in `to_token` units.
+    ///
+    /// Replay-protection parameters (`nonce`, `tx_hash`, `expiry_ts`) are verified
+    /// via [`verify_and_commit`] before the swap executes.
     pub fn cancel_copy_trade(
         env: Env,
         caller: Address,
@@ -985,7 +1094,11 @@ impl TradeExecutorContract {
         to_token: Address,
         amount: i128,
         min_received: i128,
+        entry_price: i128,
+        replay: ReplayParams,
     ) -> Result<(), ContractError> {
+        verify_and_commit(&env, &user, replay.nonce, replay.tx_hash, replay.expiry_ts)
+            .map_err(|_| ContractError::ReplayDetected)?;
         caller.require_auth();
         if caller != user {
             return Err(ContractError::Unauthorized);
@@ -1017,7 +1130,17 @@ impl TradeExecutorContract {
         let exit_price =
             execute_sdex_swap(&env, &router, &from_token, &to_token, amount, min_received)?;
 
-        let realized_pnl = exit_price - amount;
+        // Convert the entry-position value to `to_token` units so that both
+        // `exit_price` and the entry value are expressed in the same asset unit.
+        // entry_price is in 7-decimal fixed-point, so amount × entry_price has
+        // 14 implicit decimals; normalize back to 7 via the shared utility.
+        let entry_value = {
+            let product = amount
+                .checked_mul(entry_price)
+                .ok_or(ContractError::InvalidAmount)?;
+            normalize_amount(product, 14, 7).ok_or(ContractError::InvalidAmount)?
+        };
+        let realized_pnl = exit_price - entry_value;
         let close_sym = Symbol::new(&env, "close_position");
         let mut close_args = Vec::<Val>::new(&env);
         close_args.push_back(user.clone().into_val(&env));
@@ -1061,27 +1184,19 @@ impl TradeExecutorContract {
             return Err(ContractError::InvalidAmount);
         }
 
-        let portfolio: Option<Address> = env.storage().instance().get(&StorageKey::UserPortfolio);
-
-        // Sort trades by priority tier (Issue #682)
-        let (sorted_trades, _) = priority::sort_trades_by_priority(
-            &env,
-            trades,
-            portfolio.as_ref(),
-        );
-
+        let batch_ctx = prepare_batch_context(&env)?;
         let mut results: Vec<BatchTradeResult> = Vec::new(&env);
 
         for i in 0..len {
-            let trade = sorted_trades.get(i).unwrap();
-            let outcome = Self::execute_copy_trade(
-                env.clone(),
-                trade.user,
-                trade.token,
+            let trade = trades.get(i).unwrap();
+            let outcome = execute_market_copy_trade(
+                &env,
+                trade.user.clone(),
+                trade.token.clone(),
                 trade.amount,
                 None,
-                OrderType::Market,
-                None,
+                true,
+                Some(&batch_ctx),
             );
             let result = match outcome {
                 Ok(()) => BatchTradeResult {
@@ -1131,6 +1246,7 @@ impl TradeExecutorContract {
         user: Address,
         signal_id: u64,
     ) -> Result<bool, ContractError> {
+        feature_flags::require_feature_enabled(&env, feature_flags::FEAT_DCA)?;
         // Capture config needed inside the closure before moving env.
         let portfolio: Option<Address> = env.storage().instance().get(&StorageKey::UserPortfolio);
         let exempt = {
@@ -1154,13 +1270,31 @@ impl TradeExecutorContract {
     }
 
     /// Manually cancel a DCA plan. Only the plan owner may cancel.
-    pub fn cancel_dca_plan(
-        env: Env,
-        user: Address,
-        signal_id: u64,
-    ) -> Result<(), ContractError> {
+    pub fn cancel_dca_plan(env: Env, user: Address, signal_id: u64) -> Result<(), ContractError> {
         user.require_auth();
         dca::cancel_dca_plan(&env, &user, signal_id)
+    }
+
+    // ── Feature flag registry ─────────────────────────────────────────────────
+
+    /// Enable or disable a named feature flag.  Admin only.
+    ///
+    /// Emits a `feat_flag / changed` event for transparency.
+    /// Toggling a flag only affects entrypoints that explicitly check it;
+    /// all other entrypoints remain unaffected.
+    pub fn set_feature_flag(
+        env: Env,
+        name: String,
+        enabled: bool,
+    ) -> Result<(), ContractError> {
+        require_admin(&env)?;
+        feature_flags::set_flag(&env, name, enabled);
+        Ok(())
+    }
+
+    /// Return `true` when the named flag is enabled (or not set — flags default to enabled).
+    pub fn is_feature_enabled(env: Env, name: String) -> bool {
+        feature_flags::is_flag_enabled(&env, &name)
     }
 }
 

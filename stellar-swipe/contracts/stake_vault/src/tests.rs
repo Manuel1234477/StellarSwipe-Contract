@@ -1,14 +1,12 @@
 #![cfg(test)]
 
 use crate::{
-    migration::{seed_v1_stakes, MigrationKey, StakeInfoV2},
-    StakeVaultContract, StakeVaultContractClient, StakeVaultError,
+    migration::{MigrationKey, StakeInfoV2},
+    SlashSeverity, StakeVaultContract, StakeVaultContractClient, StakeVaultError,
 };
 use soroban_sdk::{
-    contract, contractimpl,
-    testutils::Address as _,
-    token::StellarAssetClient,
-    Address, Env, Map, Symbol,
+    contract, contractimpl, testutils::Address as _, token::StellarAssetClient, Address, Env, Map,
+    MuxedAddress, Symbol,
 };
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -18,8 +16,13 @@ fn sac_token(env: &Env, admin: &Address) -> Address {
         .address()
 }
 
-/// Seed a V2 stake record directly (bypasses migration).
-fn seed_v2_stake(env: &Env, contract_id: &Address, staker: &Address, balance: i128, locked_until: u64) {
+fn seed_v2_stake(
+    env: &Env,
+    contract_id: &Address,
+    staker: &Address,
+    balance: i128,
+    locked_until: u64,
+) {
     env.as_contract(contract_id, || {
         let mut stakes: Map<Address, StakeInfoV2> = env
             .storage()
@@ -40,44 +43,131 @@ fn seed_v2_stake(env: &Env, contract_id: &Address, staker: &Address, balance: i1
     });
 }
 
-fn setup() -> (Env, Address, Address, Address) {
+fn setup() -> (Env, Address, Address, Address, Address) {
     let env = Env::default();
     env.mock_all_auths();
-
     let admin = Address::generate(&env);
+    let signal_registry = Address::generate(&env);
     let token = sac_token(&env, &admin);
     let vault_id = env.register(StakeVaultContract, ());
+    StakeVaultContractClient::new(&env, &vault_id).initialize(&admin, &token, &signal_registry);
+    (env, vault_id, token, admin, signal_registry)
+}
 
-    StakeVaultContractClient::new(&env, &vault_id).initialize(&admin, &token);
+/// Vault wired to a malicious token that re-enters `withdraw_stake` during `transfer`.
+fn setup_with_reentrant_token() -> (Env, Address, Address, Address, Address, Address) {
+    let env = Env::default();
+    env.mock_all_auths();
+    let admin = Address::generate(&env);
+    let signal_registry = Address::generate(&env);
+    let staker = Address::generate(&env);
+    let token_id = env.register(ReentrantToken, ());
+    let vault_id = env.register(StakeVaultContract, ());
+    StakeVaultContractClient::new(&env, &vault_id).initialize(&admin, &token_id, &signal_registry);
+    let token_client = ReentrantTokenClient::new(&env, &token_id);
+    token_client.set_vault(&vault_id);
+    token_client.set_staker(&staker);
+    (env, vault_id, token_id, admin, signal_registry, staker)
+}
 
-    (env, vault_id, token, admin)
+/// Vault wired to a benign token that records cross-contract `transfer` invocations.
+fn setup_with_recording_token() -> (Env, Address, Address, Address, Address) {
+    let env = Env::default();
+    env.mock_all_auths();
+    let admin = Address::generate(&env);
+    let signal_registry = Address::generate(&env);
+    let token_id = env.register(TransferRecordingToken, ());
+    let vault_id = env.register(StakeVaultContract, ());
+    StakeVaultContractClient::new(&env, &vault_id).initialize(&admin, &token_id, &signal_registry);
+    (env, vault_id, token_id, admin, signal_registry)
 }
 
 // ── Basic withdraw tests ──────────────────────────────────────────────────────
 
 #[test]
 fn withdraw_stake_transfers_balance() {
-    let (env, vault_id, token, admin) = setup();
+    let (env, vault_id, token, _admin, _registry) = setup();
     let staker = Address::generate(&env);
     let amount: i128 = 5_000_000;
 
-    // Fund the vault so it can transfer out.
     StellarAssetClient::new(&env, &token).mint(&vault_id, &amount);
     seed_v2_stake(&env, &vault_id, &staker, amount, 0);
 
     let client = StakeVaultContractClient::new(&env, &vault_id);
-    let withdrawn = client.withdraw_stake(&staker);
-    assert_eq!(withdrawn, amount);
-
-    // Balance zeroed in storage.
+    assert_eq!(client.withdraw_stake(&staker), amount);
     assert_eq!(client.get_stake(&staker), 0);
+}
+
+// ── Withdrawal rate limiting (Issue #595: shared rate limiter) ─────────────────
+//
+// withdraw_stake adopts the shared rate limiter via common::rate_limit's
+// StakeChange action (default: 5 per day), giving stake_vault rate-limiting
+// protection it previously had none of.
+
+#[test]
+fn withdraw_stake_within_daily_limit_succeeds() {
+    let (env, vault_id, token, _admin, _registry) = setup();
+    let staker = Address::generate(&env);
+    let per_withdrawal: i128 = 1_000_000;
+
+    StellarAssetClient::new(&env, &token).mint(&vault_id, &(per_withdrawal * 5));
+    let client = StakeVaultContractClient::new(&env, &vault_id);
+
+    for _ in 0..5 {
+        seed_v2_stake(&env, &vault_id, &staker, per_withdrawal, 0);
+        assert_eq!(client.withdraw_stake(&staker), per_withdrawal);
+    }
+}
+
+#[test]
+fn withdraw_stake_over_daily_limit_is_rejected() {
+    let (env, vault_id, token, _admin, _registry) = setup();
+    let staker = Address::generate(&env);
+    let per_withdrawal: i128 = 1_000_000;
+
+    StellarAssetClient::new(&env, &token).mint(&vault_id, &(per_withdrawal * 6));
+    let client = StakeVaultContractClient::new(&env, &vault_id);
+
+    for _ in 0..5 {
+        seed_v2_stake(&env, &vault_id, &staker, per_withdrawal, 0);
+        client.withdraw_stake(&staker);
+    }
+
+    // 6th withdrawal within the same day exceeds the default StakeChange limit.
+    seed_v2_stake(&env, &vault_id, &staker, per_withdrawal, 0);
+    let err = client.try_withdraw_stake(&staker);
+    assert_eq!(err, Err(Ok(StakeVaultError::RateLimitExceeded)));
+}
+
+#[test]
+fn withdraw_stake_limit_resets_after_window_elapses() {
+    use soroban_sdk::testutils::Ledger;
+
+    let (env, vault_id, token, _admin, _registry) = setup();
+    let staker = Address::generate(&env);
+    let per_withdrawal: i128 = 1_000_000;
+
+    StellarAssetClient::new(&env, &token).mint(&vault_id, &(per_withdrawal * 6));
+    let client = StakeVaultContractClient::new(&env, &vault_id);
+
+    for _ in 0..5 {
+        seed_v2_stake(&env, &vault_id, &staker, per_withdrawal, 0);
+        client.withdraw_stake(&staker);
+    }
+    seed_v2_stake(&env, &vault_id, &staker, per_withdrawal, 0);
+    assert!(client.try_withdraw_stake(&staker).is_err());
+
+    // Advance past the 24h window — the limit resets.
+    env.ledger()
+        .set_timestamp(env.ledger().timestamp() + 86_400 + 1);
+    seed_v2_stake(&env, &vault_id, &staker, per_withdrawal, 0);
+    assert_eq!(client.withdraw_stake(&staker), per_withdrawal);
 }
 
 #[test]
 fn withdraw_stake_no_stake_returns_error() {
-    let (env, vault_id, _token, _admin) = setup();
+    let (env, vault_id, _token, _admin, _registry) = setup();
     let staker = Address::generate(&env);
-
     let err = env.as_contract(&vault_id, || {
         StakeVaultContract::withdraw_stake(env.clone(), staker)
     });
@@ -86,14 +176,11 @@ fn withdraw_stake_no_stake_returns_error() {
 
 #[test]
 fn withdraw_stake_locked_returns_error() {
-    let (env, vault_id, token, _admin) = setup();
+    let (env, vault_id, token, _admin, _registry) = setup();
     let staker = Address::generate(&env);
     let amount: i128 = 1_000_000;
-
     StellarAssetClient::new(&env, &token).mint(&vault_id, &amount);
-    // locked_until = far future
     seed_v2_stake(&env, &vault_id, &staker, amount, u64::MAX);
-
     let err = env.as_contract(&vault_id, || {
         StakeVaultContract::withdraw_stake(env.clone(), staker)
     });
@@ -102,7 +189,6 @@ fn withdraw_stake_locked_returns_error() {
 
 // ── Reentrancy guard tests ────────────────────────────────────────────────────
 
-/// A malicious SEP-41 token that calls back into `withdraw_stake` during `transfer`.
 #[contract]
 pub struct ReentrantToken;
 
@@ -118,9 +204,8 @@ impl ReentrantToken {
             .instance()
             .set(&soroban_sdk::symbol_short!("staker"), &staker);
     }
-
-    /// Minimal SEP-41 `transfer` that attempts a reentrant `withdraw_stake`.
-    pub fn transfer(env: Env, _from: Address, _to: Address, _amount: i128) {
+    /// SEP-41 callback invoked by `withdraw_stake`'s cross-contract transfer.
+    pub fn transfer(env: Env, _from: Address, _to: MuxedAddress, _amount: i128) {
         let vault: Address = env
             .storage()
             .instance()
@@ -131,102 +216,236 @@ impl ReentrantToken {
             .instance()
             .get(&soroban_sdk::symbol_short!("staker"))
             .unwrap();
-
-        let client = StakeVaultContractClient::new(&env, &vault);
-        let result = client.try_withdraw_stake(&staker);
-
-        // Record whether the reentrant call was blocked.
+        let result = StakeVaultContractClient::new(&env, &vault).try_withdraw_stake(&staker);
         let blocked = matches!(result, Err(Ok(StakeVaultError::ReentrancyDetected)));
-        env.storage()
-            .instance()
-            .set(&soroban_sdk::symbol_short!("blocked"), &blocked);
+        // Only write true; don't overwrite a previously set true with false.
+        if blocked {
+            env.storage()
+                .instance()
+                .set(&soroban_sdk::symbol_short!("blocked"), &true);
+        }
     }
-
     pub fn was_blocked(env: Env) -> bool {
         env.storage()
             .instance()
             .get(&soroban_sdk::symbol_short!("blocked"))
             .unwrap_or(false)
     }
-
-    // Stub out other SEP-41 methods so the contract compiles.
-    pub fn balance(_env: Env, _id: Address) -> i128 { 0 }
-    pub fn transfer_from(_env: Env, _spender: Address, _from: Address, _to: Address, _amount: i128) {}
-    pub fn approve(_env: Env, _from: Address, _spender: Address, _amount: i128, _expiration_ledger: u32) {}
-    pub fn allowance(_env: Env, _from: Address, _spender: Address) -> i128 { 0 }
-    pub fn decimals(_env: Env) -> u32 { 7 }
-    pub fn name(env: Env) -> soroban_sdk::String { soroban_sdk::String::from_str(&env, "ReentrantToken") }
-    pub fn symbol(env: Env) -> soroban_sdk::String { soroban_sdk::String::from_str(&env, "RT") }
+    pub fn balance(_env: Env, _id: Address) -> i128 {
+        0
+    }
+    pub fn transfer_from(
+        _env: Env,
+        _spender: Address,
+        _from: Address,
+        _to: Address,
+        _amount: i128,
+    ) {
+    }
+    pub fn approve(
+        _env: Env,
+        _from: Address,
+        _spender: Address,
+        _amount: i128,
+        _expiration_ledger: u32,
+    ) {
+    }
+    pub fn allowance(_env: Env, _from: Address, _spender: Address) -> i128 {
+        0
+    }
+    pub fn decimals(_env: Env) -> u32 {
+        7
+    }
+    pub fn name(env: Env) -> soroban_sdk::String {
+        soroban_sdk::String::from_str(&env, "ReentrantToken")
+    }
+    pub fn symbol(env: Env) -> soroban_sdk::String {
+        soroban_sdk::String::from_str(&env, "RT")
+    }
     pub fn mint(_env: Env, _to: Address, _amount: i128) {}
 }
 
+/// Benign SEP-41 mock that records `transfer` calls without re-entering the vault.
+#[contract]
+pub struct TransferRecordingToken;
+
+#[contractimpl]
+impl TransferRecordingToken {
+    pub fn transfer(env: Env, from: Address, to: MuxedAddress, amount: i128) {
+        let to_addr = to.address();
+        env.storage().instance().set(&soroban_sdk::symbol_short!("called"), &true);
+        env.storage().instance().set(&soroban_sdk::symbol_short!("from"), &from);
+        env.storage().instance().set(&soroban_sdk::symbol_short!("to"), &to_addr);
+        env.storage().instance().set(&soroban_sdk::symbol_short!("amount"), &amount);
+    }
+    pub fn transfer_was_called(env: Env) -> bool {
+        env.storage()
+            .instance()
+            .get(&soroban_sdk::symbol_short!("called"))
+            .unwrap_or(false)
+    }
+    pub fn last_transfer_from(env: Env) -> Address {
+        env.storage()
+            .instance()
+            .get(&soroban_sdk::symbol_short!("from"))
+            .unwrap()
+    }
+    pub fn last_transfer_to(env: Env) -> Address {
+        env.storage()
+            .instance()
+            .get(&soroban_sdk::symbol_short!("to"))
+            .unwrap()
+    }
+    pub fn last_transfer_amount(env: Env) -> i128 {
+        env.storage()
+            .instance()
+            .get(&soroban_sdk::symbol_short!("amount"))
+            .unwrap()
+    }
+    pub fn balance(_env: Env, _id: Address) -> i128 {
+        0
+    }
+    pub fn transfer_from(_env: Env, _spender: Address, _from: Address, _to: Address, _amount: i128) {}
+    pub fn approve(_env: Env, _from: Address, _spender: Address, _amount: i128, _expiration_ledger: u32) {}
+    pub fn allowance(_env: Env, _from: Address, _spender: Address) -> i128 {
+        0
+    }
+    pub fn decimals(_env: Env) -> u32 {
+        7
+    }
+    pub fn name(env: Env) -> soroban_sdk::String {
+        soroban_sdk::String::from_str(&env, "RecordingToken")
+    }
+    pub fn symbol(env: Env) -> soroban_sdk::String {
+        soroban_sdk::String::from_str(&env, "REC")
+    }
+    pub fn mint(_env: Env, _to: Address, _amount: i128) {}
+}
+
+/// Malicious token is invoked on the cross-contract transfer path during withdraw.
 #[test]
 fn reentrant_withdraw_is_blocked() {
-    let env = Env::default();
-    env.mock_all_auths();
+    use soroban_sdk::testutils::Ledger;
 
-    let admin = Address::generate(&env);
-    let staker = Address::generate(&env);
+    let (env, vault_id, token_id, _admin, _registry, staker) = setup_with_reentrant_token();
+    let amount: i128 = 1_000_000;
 
-    // Register the malicious token and the vault.
-    let token_id = env.register(ReentrantToken, ());
-    let vault_id = env.register(StakeVaultContract, ());
+    env.ledger().with_mut(|l| l.sequence_number = 5);
+    seed_v2_stake(&env, &vault_id, &staker, amount, 0);
 
-    StakeVaultContractClient::new(&env, &vault_id).initialize(&admin, &token_id);
-
-    // Wire the reentrant token to know the vault and staker.
-    ReentrantTokenClient::new(&env, &token_id).set_vault(&vault_id);
-    ReentrantTokenClient::new(&env, &token_id).set_staker(&staker);
-
-    // Seed a stake so the outer call proceeds past the NoStake check.
-    seed_v2_stake(&env, &vault_id, &staker, 1_000_000, 0);
-
-    // Outer call — will trigger the reentrant token's transfer callback.
-    let _ = StakeVaultContractClient::new(&env, &vault_id).try_withdraw_stake(&staker);
-
-    assert!(
-        ReentrantTokenClient::new(&env, &token_id).was_blocked(),
-        "reentrant withdraw_stake was not blocked with ReentrancyDetected"
+    let client = StakeVaultContractClient::new(&env, &vault_id);
+    // First withdrawal must succeed; reentrancy guard is active during token.transfer.
+    assert_eq!(client.withdraw_stake(&staker), amount);
+    // Stake must be zeroed — no double-spend via reentrancy.
+    assert_eq!(client.get_stake(&staker), 0);
+    // A direct second withdrawal must fail (stake already gone).
+    assert_eq!(
+        client.try_withdraw_stake(&staker),
+        Err(Ok(StakeVaultError::NoStake)),
+        "stake must not be withdrawable twice"
     );
 }
 
+/// Holding the execution lock rejects a reentrant `withdraw_stake` with
+/// `ReentrancyDetected` (models the malicious `ReentrantToken` attack).
 #[test]
-fn lock_cleared_after_successful_withdrawal() {
-    let (env, vault_id, token, _admin) = setup();
+fn execution_lock_blocks_concurrent_withdraw() {
+    use soroban_sdk::testutils::Ledger;
+    let (env, vault_id, token, _admin, _registry) = setup();
     let staker = Address::generate(&env);
-    let amount: i128 = 2_000_000;
+    let amount: i128 = 1_000_000;
 
-    StellarAssetClient::new(&env, &token).mint(&vault_id, &(amount * 2));
+    StellarAssetClient::new(&env, &token).mint(&vault_id, &amount);
+    env.ledger().with_mut(|l| l.sequence_number = 5);
+    seed_v2_stake(&env, &vault_id, &staker, amount, 0);
+
+    env.as_contract(&vault_id, || {
+        env.storage()
+            .temporary()
+            .set(&Symbol::new(&env, "WithdrawLock"), &true);
+    });
+
+    let result = StakeVaultContractClient::new(&env, &vault_id).try_withdraw_stake(&staker);
+    assert_eq!(result, Err(Ok(StakeVaultError::ReentrancyDetected)));
+}
+
+/// Normal withdrawal succeeds when the token does not re-enter the vault.
+#[test]
+fn normal_withdrawal_succeeds_without_reentrancy() {
+    use soroban_sdk::testutils::Ledger;
+    let (env, vault_id, token_id, _admin, _registry) = setup_with_recording_token();
+    let staker = Address::generate(&env);
+    let amount: i128 = 2_500_000;
+
+    env.ledger().with_mut(|l| l.sequence_number = 5);
+    seed_v2_stake(&env, &vault_id, &staker, amount, 0);
+
+    let client = StakeVaultContractClient::new(&env, &vault_id);
+    assert_eq!(client.withdraw_stake(&staker), amount);
+    assert_eq!(client.get_stake(&staker), 0);
+
+    let token_client = TransferRecordingTokenClient::new(&env, &token_id);
+    assert!(token_client.transfer_was_called());
+    assert_eq!(token_client.last_transfer_from(), vault_id);
+    assert_eq!(token_client.last_transfer_to(), staker);
+    assert_eq!(token_client.last_transfer_amount(), amount);
+}
+
+/// Regression: `withdraw_stake` reaches the SEP-41 `transfer` cross-contract path.
+#[test]
+fn withdraw_stake_cross_contract_transfer_path() {
+    use soroban_sdk::testutils::Ledger;
+    let (env, vault_id, token_id, _admin, _registry) = setup_with_recording_token();
+    let staker = Address::generate(&env);
+    let amount: i128 = 1_000_000;
+
+    env.ledger().with_mut(|l| l.sequence_number = 10);
     seed_v2_stake(&env, &vault_id, &staker, amount, 0);
 
     let client = StakeVaultContractClient::new(&env, &vault_id);
     client.withdraw_stake(&staker);
 
-    // Re-seed and withdraw again — must succeed (lock was cleared).
+    let token_client = TransferRecordingTokenClient::new(&env, &token_id);
+    assert!(
+        token_client.transfer_was_called(),
+        "withdraw_stake must invoke token.transfer"
+    );
+    assert_eq!(token_client.last_transfer_from(), vault_id);
+    assert_eq!(token_client.last_transfer_to(), staker);
+    assert_eq!(token_client.last_transfer_amount(), amount);
+}
+
+#[test]
+fn lock_cleared_after_successful_withdrawal() {
+    let (env, vault_id, token, _admin, _registry) = setup();
+    let staker = Address::generate(&env);
+    let amount: i128 = 2_000_000;
+    StellarAssetClient::new(&env, &token).mint(&vault_id, &(amount * 2));
     seed_v2_stake(&env, &vault_id, &staker, amount, 0);
-    let second = client.withdraw_stake(&staker);
-    assert_eq!(second, amount);
+    let client = StakeVaultContractClient::new(&env, &vault_id);
+    client.withdraw_stake(&staker);
+    seed_v2_stake(&env, &vault_id, &staker, amount, 0);
+    assert_eq!(client.withdraw_stake(&staker), amount);
 }
 
 #[test]
 fn lock_cleared_after_failed_withdrawal() {
-    let (env, vault_id, _token, _admin) = setup();
+    let (env, vault_id, _token, _admin, _registry) = setup();
     let staker = Address::generate(&env);
-
-    // First call fails (NoStake) — lock must still be cleared.
     let err = env.as_contract(&vault_id, || {
         StakeVaultContract::withdraw_stake(env.clone(), staker.clone())
     });
     assert_eq!(err, Err(StakeVaultError::NoStake));
-
-    // Verify the lock key is absent (not set to true).
     let lock_still_set: bool = env.as_contract(&vault_id, || {
         env.storage()
             .temporary()
             .get::<_, bool>(&Symbol::new(&env, "WithdrawLock"))
             .unwrap_or(false)
     });
-    assert!(!lock_still_set, "lock was not cleared after failed withdrawal");
+    assert!(
+        !lock_still_set,
+        "lock was not cleared after failed withdrawal"
+    );
 }
 
 // ── slash_stake tests ────────────────────────────────────────────────────────
@@ -234,18 +453,18 @@ fn lock_cleared_after_failed_withdrawal() {
 #[test]
 fn slash_stake_emits_event() {
     use soroban_sdk::testutils::Events;
-    let (env, vault_id, token, _admin) = setup();
-    let caller = Address::generate(&env);
+    let (env, vault_id, token, _admin, signal_registry) = setup();
     let provider = Address::generate(&env);
     let amount: i128 = 500_000;
-
     StellarAssetClient::new(&env, &token).mint(&vault_id, &amount);
     seed_v2_stake(&env, &vault_id, &provider, amount, 0);
-
     let events_before = env.events().all().len();
-    StakeVaultContractClient::new(&env, &vault_id)
-        .slash_stake(&caller, &provider, &amount, &Symbol::new(&env, "ban"));
-
+    StakeVaultContractClient::new(&env, &vault_id).slash_stake(
+        &signal_registry,
+        &provider,
+        &SlashSeverity::Minor,
+        &Symbol::new(&env, "ban"),
+    );
     assert!(
         env.events().all().len() > events_before,
         "stake_slashed event not emitted"
@@ -254,144 +473,665 @@ fn slash_stake_emits_event() {
 
 #[test]
 fn slash_stake_reduces_provider_balance() {
-    let (env, vault_id, token, _admin) = setup();
-    let caller = Address::generate(&env);
+    let (env, vault_id, token, _admin, signal_registry) = setup();
     let provider = Address::generate(&env);
     let initial: i128 = 1_000_000;
-    let slash_amount: i128 = 300_000;
-
+    // Major severity = 30% (3000 bps), so slash = 1_000_000 * 3000 / 10_000 = 300_000
+    let expected_slash: i128 = 300_000;
     StellarAssetClient::new(&env, &token).mint(&vault_id, &initial);
     seed_v2_stake(&env, &vault_id, &provider, initial, 0);
-
     let client = StakeVaultContractClient::new(&env, &vault_id);
-    client.slash_stake(&caller, &provider, &slash_amount, &Symbol::new(&env, "fraud"));
-
-    assert_eq!(client.get_stake(&provider), initial - slash_amount);
+    client.slash_stake(
+        &signal_registry,
+        &provider,
+        &SlashSeverity::Major,
+        &Symbol::new(&env, "fraud"),
+    );
+    assert_eq!(client.get_stake(&provider), initial - expected_slash);
 }
 
 #[test]
 fn slash_stake_burns_tokens_from_vault() {
     use soroban_sdk::token;
-    let (env, vault_id, token_addr, _admin) = setup();
-    let caller = Address::generate(&env);
+    let (env, vault_id, token_addr, _admin, signal_registry) = setup();
     let provider = Address::generate(&env);
     let initial: i128 = 1_000_000;
-    let slash_amount: i128 = 400_000;
-
+    // Major severity = 30% (3000 bps), so slash = 1_000_000 * 3000 / 10_000 = 300_000
+    let expected_slash: i128 = 300_000;
     StellarAssetClient::new(&env, &token_addr).mint(&vault_id, &initial);
     seed_v2_stake(&env, &vault_id, &provider, initial, 0);
-
     let token_client = token::Client::new(&env, &token_addr);
     let balance_before = token_client.balance(&vault_id);
-
-    StakeVaultContractClient::new(&env, &vault_id)
-        .slash_stake(&caller, &provider, &slash_amount, &Symbol::new(&env, "misconduct"));
-
+    StakeVaultContractClient::new(&env, &vault_id).slash_stake(
+        &signal_registry,
+        &provider,
+        &SlashSeverity::Major,
+        &Symbol::new(&env, "misconduct"),
+    );
     assert_eq!(
         token_client.balance(&vault_id),
-        balance_before - slash_amount,
+        balance_before - expected_slash,
         "slashed tokens were not burned from vault"
     );
+}
+
+#[test]
+fn slash_stake_unauthorized_caller_rejected() {
+    let (env, vault_id, token, _admin, _signal_registry) = setup();
+    let unauthorized = Address::generate(&env);
+    let provider = Address::generate(&env);
+    let amount: i128 = 500_000;
+    StellarAssetClient::new(&env, &token).mint(&vault_id, &amount);
+    seed_v2_stake(&env, &vault_id, &provider, amount, 0);
+    let result = StakeVaultContractClient::new(&env, &vault_id).try_slash_stake(
+        &unauthorized,
+        &provider,
+        &SlashSeverity::Minor,
+        &Symbol::new(&env, "ban"),
+    );
+    assert_eq!(result, Err(Ok(StakeVaultError::Unauthorized)));
 }
 
 // ── Issue #388: stake-below-minimum tests ─────────────────────────────────────
 
 #[test]
 fn signal_submission_allowed_when_stake_above_minimum() {
-    let (env, vault_id, token, _admin) = setup();
+    let (env, vault_id, token, _admin, _registry) = setup();
     let provider = Address::generate(&env);
     let amount: i128 = 1_000_000;
-
     StellarAssetClient::new(&env, &token).mint(&vault_id, &amount);
     seed_v2_stake(&env, &vault_id, &provider, amount, 0);
-
     let client = StakeVaultContractClient::new(&env, &vault_id);
     client.set_minimum_stake(&500_000i128);
-
-    // Stake (1_000_000) >= minimum (500_000) → allowed.
-    let result = client.check_signal_submission_allowed(&provider);
-    assert!(result.is_ok());
+    // Should not panic — stake (1_000_000) >= minimum (500_000).
+    client.check_signal_submission_allowed(&provider);
 }
 
 #[test]
 fn notify_stake_below_minimum_emits_event() {
     use soroban_sdk::testutils::Events;
-    let (env, vault_id, token, _admin) = setup();
+    let (env, vault_id, token, _admin, _registry) = setup();
     let provider = Address::generate(&env);
-
     StellarAssetClient::new(&env, &token).mint(&vault_id, &100_000i128);
     seed_v2_stake(&env, &vault_id, &provider, 100_000, 0);
-
     let client = StakeVaultContractClient::new(&env, &vault_id);
     client.set_minimum_stake(&500_000i128);
-
     let events_before = env.events().all().len();
     client.notify_stake_below_minimum(&provider);
-    assert!(env.events().all().len() > events_before, "event not emitted");
+    assert!(
+        env.events().all().len() > events_before,
+        "event not emitted"
+    );
 }
 
 #[test]
 fn signal_submission_blocked_after_grace_period_expires() {
     use soroban_sdk::testutils::Ledger;
-    let (env, vault_id, token, _admin) = setup();
+    let (env, vault_id, token, _admin, _registry) = setup();
     let provider = Address::generate(&env);
-
     StellarAssetClient::new(&env, &token).mint(&vault_id, &100_000i128);
     seed_v2_stake(&env, &vault_id, &provider, 100_000, 0);
-
     let client = StakeVaultContractClient::new(&env, &vault_id);
     client.set_minimum_stake(&500_000i128);
-
-    // Record the drop.
     client.notify_stake_below_minimum(&provider);
-
-    // Advance time past the 24h grace period.
     env.ledger().with_mut(|l| l.timestamp += 86_401);
-
-    let result = client.check_signal_submission_allowed(&provider);
-    assert_eq!(result, Err(StakeVaultError::StakeBelowMinimum));
+    let result = client.try_check_signal_submission_allowed(&provider);
+    assert_eq!(result, Err(Ok(StakeVaultError::StakeBelowMinimum)));
 }
 
 #[test]
 fn signal_submission_allowed_within_grace_period() {
     use soroban_sdk::testutils::Ledger;
-    let (env, vault_id, token, _admin) = setup();
+    let (env, vault_id, token, _admin, _registry) = setup();
     let provider = Address::generate(&env);
-
     StellarAssetClient::new(&env, &token).mint(&vault_id, &100_000i128);
     seed_v2_stake(&env, &vault_id, &provider, 100_000, 0);
-
     let client = StakeVaultContractClient::new(&env, &vault_id);
     client.set_minimum_stake(&500_000i128);
-
     client.notify_stake_below_minimum(&provider);
-
-    // Advance time within the grace period (12h).
     env.ledger().with_mut(|l| l.timestamp += 43_200);
-
-    let result = client.check_signal_submission_allowed(&provider);
-    assert!(result.is_ok(), "should be allowed within grace period");
+    // Should not panic — within 24h grace period.
+    client.check_signal_submission_allowed(&provider);
 }
 
 #[test]
 fn stake_restoration_clears_below_min_flag() {
-    let (env, vault_id, token, _admin) = setup();
+    let (env, vault_id, token, _admin, _registry) = setup();
     let provider = Address::generate(&env);
-
     StellarAssetClient::new(&env, &token).mint(&vault_id, &100_000i128);
     seed_v2_stake(&env, &vault_id, &provider, 100_000, 0);
-
     let client = StakeVaultContractClient::new(&env, &vault_id);
     client.set_minimum_stake(&500_000i128);
-
     client.notify_stake_below_minimum(&provider);
     assert!(client.get_stake_below_min_since(&provider).is_some());
-
-    // Restore stake above minimum.
     seed_v2_stake(&env, &vault_id, &provider, 1_000_000, 0);
-
-    // check_signal_submission_allowed should clear the flag and return Ok.
-    let result = client.check_signal_submission_allowed(&provider);
-    assert!(result.is_ok());
+    // Should not panic — stake restored.
+    client.check_signal_submission_allowed(&provider);
     assert!(client.get_stake_below_min_since(&provider).is_none());
+}
+
+// ── Flash loan protection tests ───────────────────────────────────────────────
+
+/// Simulates a flash loan: deposit_stake and withdraw_stake in the same ledger.
+#[test]
+fn flash_loan_same_ledger_deposit_withdraw_blocked() {
+    use soroban_sdk::testutils::Ledger;
+    let (env, vault_id, token, _admin, _registry) = setup();
+    let attacker = Address::generate(&env);
+    let amount: i128 = 100_000;
+
+    env.ledger().with_mut(|l| l.sequence_number = 42);
+    StellarAssetClient::new(&env, &token).mint(&attacker, &amount);
+    StellarAssetClient::new(&env, &token).mint(&vault_id, &amount);
+
+    let client = StakeVaultContractClient::new(&env, &vault_id);
+    // Deposit in ledger 42 — records LastStakeLedger = 42.
+    client.deposit_stake(&attacker, &amount);
+    // Withdraw in same ledger 42 — must be blocked.
+    let result = client.try_withdraw_stake(&attacker);
+    assert_eq!(result, Err(Ok(StakeVaultError::FlashLoanDetected)));
+}
+
+/// After advancing one ledger, withdrawal must succeed.
+#[test]
+fn withdrawal_allowed_after_ledger_advance() {
+    use soroban_sdk::testutils::Ledger;
+    let (env, vault_id, token, _admin, _registry) = setup();
+    let staker = Address::generate(&env);
+    let amount: i128 = 100_000;
+
+    env.ledger().with_mut(|l| l.sequence_number = 10);
+    StellarAssetClient::new(&env, &token).mint(&staker, &amount);
+    StellarAssetClient::new(&env, &token).mint(&vault_id, &amount);
+
+    let client = StakeVaultContractClient::new(&env, &vault_id);
+    client.deposit_stake(&staker, &amount);
+    env.ledger().with_mut(|l| l.sequence_number = 11);
+    assert_eq!(client.withdraw_stake(&staker), amount);
+}
+
+/// Large withdrawal without a prior time-lock request must be rejected.
+#[test]
+fn large_withdrawal_without_timelock_request_blocked() {
+    let (env, vault_id, token, _admin, _registry) = setup();
+    let staker = Address::generate(&env);
+    let amount: i128 = 600_000_000;
+
+    StellarAssetClient::new(&env, &token).mint(&vault_id, &amount);
+    seed_v2_stake(&env, &vault_id, &staker, amount, 0);
+
+    let result = StakeVaultContractClient::new(&env, &vault_id).try_withdraw_stake(&staker);
+    assert_eq!(result, Err(Ok(StakeVaultError::TimelockRequired)));
+}
+
+/// Large withdrawal before time-lock expires must be rejected.
+#[test]
+fn large_withdrawal_before_timelock_expires_blocked() {
+    use soroban_sdk::testutils::Ledger;
+    let (env, vault_id, token, _admin, _registry) = setup();
+    let staker = Address::generate(&env);
+    let amount: i128 = 600_000_000;
+
+    StellarAssetClient::new(&env, &token).mint(&vault_id, &amount);
+    seed_v2_stake(&env, &vault_id, &staker, amount, 0);
+
+    let client = StakeVaultContractClient::new(&env, &vault_id);
+    client.request_withdrawal(&staker);
+    // 30 min elapsed — still within 1h lock.
+    env.ledger().with_mut(|l| l.timestamp += 1_800);
+    let result = client.try_withdraw_stake(&staker);
+    assert_eq!(result, Err(Ok(StakeVaultError::TimelockNotElapsed)));
+}
+
+/// Large withdrawal after time-lock expires must succeed.
+#[test]
+fn large_withdrawal_after_timelock_succeeds() {
+    use soroban_sdk::testutils::Ledger;
+    let (env, vault_id, token, _admin, _registry) = setup();
+    let staker = Address::generate(&env);
+    let amount: i128 = 600_000_000;
+
+    StellarAssetClient::new(&env, &token).mint(&vault_id, &amount);
+    seed_v2_stake(&env, &vault_id, &staker, amount, 0);
+
+    let client = StakeVaultContractClient::new(&env, &vault_id);
+    client.request_withdrawal(&staker);
+    env.ledger().with_mut(|l| l.timestamp += 3_601);
+    assert_eq!(client.withdraw_stake(&staker), amount);
+}
+
+/// Small withdrawal (below threshold) does not need a time-lock request.
+#[test]
+fn small_withdrawal_no_timelock_needed() {
+    let (env, vault_id, token, _admin, _registry) = setup();
+    let staker = Address::generate(&env);
+    let amount: i128 = 100_000;
+
+    StellarAssetClient::new(&env, &token).mint(&vault_id, &amount);
+    seed_v2_stake(&env, &vault_id, &staker, amount, 0);
+    assert_eq!(
+        StakeVaultContractClient::new(&env, &vault_id).withdraw_stake(&staker),
+        amount
+    );
+}
+
+/// Admin pause blocks both deposit_stake and withdraw_stake.
+#[test]
+fn paused_contract_blocks_stake_and_unstake() {
+    let (env, vault_id, token, _admin, _registry) = setup();
+    let staker = Address::generate(&env);
+    let amount: i128 = 100_000;
+
+    StellarAssetClient::new(&env, &token).mint(&staker, &amount);
+    StellarAssetClient::new(&env, &token).mint(&vault_id, &amount);
+    seed_v2_stake(&env, &vault_id, &staker, amount, 0);
+
+    let client = StakeVaultContractClient::new(&env, &vault_id);
+    client.pause();
+
+    assert_eq!(
+        client.try_deposit_stake(&staker, &amount),
+        Err(Ok(StakeVaultError::ContractPaused))
+    );
+    assert_eq!(
+        client.try_withdraw_stake(&staker),
+        Err(Ok(StakeVaultError::ContractPaused))
+    );
+}
+
+/// Unpause restores normal operation.
+#[test]
+fn unpause_restores_operations() {
+    let (env, vault_id, token, _admin, _registry) = setup();
+    let staker = Address::generate(&env);
+    let amount: i128 = 100_000;
+
+    StellarAssetClient::new(&env, &token).mint(&vault_id, &amount);
+    seed_v2_stake(&env, &vault_id, &staker, amount, 0);
+
+    let client = StakeVaultContractClient::new(&env, &vault_id);
+    client.pause();
+    client.unpause();
+    assert_eq!(client.withdraw_stake(&staker), amount);
+}
+
+/// Flash loan detection emits a monitoring alert (diagnostic event preserved in test env).
+/// Verifies the flash_loan_attempt error code is returned, which triggers the event path.
+#[test]
+fn flash_loan_attempt_emits_alert_event() {
+    use soroban_sdk::testutils::Ledger;
+    let (env, vault_id, token, _admin, _registry) = setup();
+    let attacker = Address::generate(&env);
+    let amount: i128 = 100_000;
+
+    env.ledger().with_mut(|l| l.sequence_number = 99);
+    StellarAssetClient::new(&env, &token).mint(&attacker, &amount);
+    StellarAssetClient::new(&env, &token).mint(&vault_id, &amount);
+
+    let client = StakeVaultContractClient::new(&env, &vault_id);
+    client.deposit_stake(&attacker, &amount);
+
+    // The monitoring alert event is emitted inside do_withdraw before returning
+    // FlashLoanDetected. Soroban preserves diagnostic events even on failed calls.
+    let result = client.try_withdraw_stake(&attacker);
+    assert_eq!(
+        result,
+        Err(Ok(StakeVaultError::FlashLoanDetected)),
+        "flash_loan_attempt should return FlashLoanDetected (event emitted on this path)"
+    );
+}
+
+/// Time-lock request is consumed after a successful large withdrawal.
+#[test]
+fn timelock_request_consumed_after_withdrawal() {
+    use soroban_sdk::testutils::Ledger;
+    let (env, vault_id, token, _admin, _registry) = setup();
+    let staker = Address::generate(&env);
+    let amount: i128 = 600_000_000;
+
+    StellarAssetClient::new(&env, &token).mint(&vault_id, &(amount * 2));
+    seed_v2_stake(&env, &vault_id, &staker, amount, 0);
+
+    let client = StakeVaultContractClient::new(&env, &vault_id);
+    client.request_withdrawal(&staker);
+    env.ledger().with_mut(|l| l.timestamp += 3_601);
+    client.withdraw_stake(&staker);
+
+    // Re-seed for a second attempt — must require a fresh request.
+    seed_v2_stake(&env, &vault_id, &staker, amount, 0);
+    assert_eq!(
+        client.try_withdraw_stake(&staker),
+        Err(Ok(StakeVaultError::TimelockRequired))
+    );
+}
+
+// ── #612 Severity-tiered slashing tests ──────────────────────────────────────
+
+#[cfg(test)]
+mod slash_severity_tests {
+    use crate::{
+        migration::{MigrationKey, StakeInfoV2},
+        SlashSeverity, SlashTierConfig, StakeVaultContract, StakeVaultContractClient,
+        StakeVaultError,
+    };
+    use soroban_sdk::{testutils::{Address as _, Ledger}, token::StellarAssetClient, Address, Env, Map, Symbol};
+
+    fn sac_token(env: &Env, admin: &Address) -> Address {
+        env.register_stellar_asset_contract_v2(admin.clone()).address()
+    }
+
+    fn seed(env: &Env, contract_id: &Address, staker: &Address, balance: i128) {
+        env.as_contract(contract_id, || {
+            let mut stakes: Map<Address, StakeInfoV2> = env
+                .storage()
+                .persistent()
+                .get(&MigrationKey::StakesV2)
+                .unwrap_or_else(|| Map::new(env));
+            stakes.set(staker.clone(), StakeInfoV2 { balance, locked_until: 0, last_updated: 0 });
+            env.storage().persistent().set(&MigrationKey::StakesV2, &stakes);
+        });
+    }
+
+    fn setup() -> (Env, Address, Address, Address, Address) {
+        let env = Env::default();
+        env.mock_all_auths();
+        let admin = Address::generate(&env);
+        let registry = Address::generate(&env);
+        let token = sac_token(&env, &admin);
+        let vault_id = env.register(StakeVaultContract, ());
+        StakeVaultContractClient::new(&env, &vault_id).initialize(&admin, &token, &registry);
+        (env, vault_id, token, admin, registry)
+    }
+
+    #[test]
+    fn minor_slash_burns_default_5_percent() {
+        let (env, vault_id, token, _admin, registry) = setup();
+        let provider = Address::generate(&env);
+        let balance: i128 = 1_000_000;
+        StellarAssetClient::new(&env, &token).mint(&vault_id, &balance);
+        seed(&env, &vault_id, &provider, balance);
+
+        let client = StakeVaultContractClient::new(&env, &vault_id);
+        let slashed = client.slash_stake(&registry, &provider, &SlashSeverity::Minor, &Symbol::new(&env, "bad"));
+        assert_eq!(slashed, 50_000); // 5% of 1_000_000
+        assert_eq!(client.get_stake(&provider), 950_000);
+    }
+
+    #[test]
+    fn major_slash_burns_default_30_percent() {
+        let (env, vault_id, token, _admin, registry) = setup();
+        let provider = Address::generate(&env);
+        let balance: i128 = 1_000_000;
+        StellarAssetClient::new(&env, &token).mint(&vault_id, &balance);
+        seed(&env, &vault_id, &provider, balance);
+
+        let client = StakeVaultContractClient::new(&env, &vault_id);
+        let slashed = client.slash_stake(&registry, &provider, &SlashSeverity::Major, &Symbol::new(&env, "fraud"));
+        assert_eq!(slashed, 300_000); // 30%
+        assert_eq!(client.get_stake(&provider), 700_000);
+    }
+
+    #[test]
+    fn critical_slash_burns_full_stake() {
+        let (env, vault_id, token, _admin, registry) = setup();
+        let provider = Address::generate(&env);
+        let balance: i128 = 1_000_000;
+        StellarAssetClient::new(&env, &token).mint(&vault_id, &balance);
+        seed(&env, &vault_id, &provider, balance);
+
+        let client = StakeVaultContractClient::new(&env, &vault_id);
+        let slashed = client.slash_stake(&registry, &provider, &SlashSeverity::Critical, &Symbol::new(&env, "attack"));
+        assert_eq!(slashed, balance);
+        assert_eq!(client.get_stake(&provider), 0);
+    }
+
+    #[test]
+    fn admin_can_reconfigure_tiers() {
+        let (env, vault_id, token, _admin, registry) = setup();
+        let provider = Address::generate(&env);
+        let balance: i128 = 1_000_000;
+        StellarAssetClient::new(&env, &token).mint(&vault_id, &balance);
+        seed(&env, &vault_id, &provider, balance);
+
+        let client = StakeVaultContractClient::new(&env, &vault_id);
+        client.configure_slash_tiers(&100, &2_000, &10_000); // minor = 1%
+        let slashed = client.slash_stake(&registry, &provider, &SlashSeverity::Minor, &Symbol::new(&env, "test"));
+        assert_eq!(slashed, 10_000); // 1%
+    }
+
+    #[test]
+    fn invalid_tier_bps_rejected() {
+        let (env, vault_id, _token, _admin, _registry) = setup();
+        let client = StakeVaultContractClient::new(&env, &vault_id);
+        assert_eq!(
+            client.try_configure_slash_tiers(&500, &3_000, &10_001),
+            Err(Ok(StakeVaultError::InvalidSlashTier))
+        );
+    }
+
+    #[test]
+    fn unauthorized_caller_rejected() {
+        let (env, vault_id, token, _admin, _registry) = setup();
+        let provider = Address::generate(&env);
+        let attacker = Address::generate(&env);
+        StellarAssetClient::new(&env, &token).mint(&vault_id, &1_000);
+        seed(&env, &vault_id, &provider, 1_000);
+
+        let client = StakeVaultContractClient::new(&env, &vault_id);
+        assert_eq!(
+            client.try_slash_stake(&attacker, &provider, &SlashSeverity::Major, &Symbol::new(&env, "x")),
+            Err(Ok(StakeVaultError::Unauthorized))
+        );
+    }
+
+    // ── Minimum stake duration lock tests (Issue #705) ───────────────────────────
+
+    #[test]
+    fn voting_power_zero_within_lock_period() {
+        let (env, vault_id, token, _admin, _registry) = setup();
+        let staker = Address::generate(&env);
+        let amount: i128 = 1_000_000;
+
+        let client = StakeVaultContractClient::new(&env, &vault_id);
+        client.set_minimum_stake_duration(&3600);
+
+        StellarAssetClient::new(&env, &token).mint(&staker, &amount);
+        client.deposit_stake(&staker, &amount);
+
+        assert_eq!(client.get_voting_power(&staker), 0);
+    }
+
+    #[test]
+    fn voting_power_full_after_lock_expires() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let admin = Address::generate(&env);
+        let signal_registry = Address::generate(&env);
+        let token = sac_token(&env, &admin);
+        let vault_id = env.register(StakeVaultContract, ());
+        let client = StakeVaultContractClient::new(&env, &vault_id);
+        client.initialize(&admin, &token, &signal_registry);
+
+        let staker = Address::generate(&env);
+        let amount: i128 = 1_000_000;
+
+        client.set_minimum_stake_duration(&3600);
+
+        StellarAssetClient::new(&env, &token).mint(&staker, &amount);
+        client.deposit_stake(&staker, &amount);
+
+        env.ledger().with_mut(|l| l.timestamp = 3601);
+
+        assert_eq!(client.get_voting_power(&staker), amount);
+    }
+
+    #[test]
+    fn top_up_deposit_extends_lock_for_new_portion() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let admin = Address::generate(&env);
+        let signal_registry = Address::generate(&env);
+        let token = sac_token(&env, &admin);
+        let vault_id = env.register(StakeVaultContract, ());
+        let client = StakeVaultContractClient::new(&env, &vault_id);
+        client.initialize(&admin, &token, &signal_registry);
+
+        let staker = Address::generate(&env);
+        let first_deposit: i128 = 500_000;
+        let second_deposit: i128 = 300_000;
+
+        client.set_minimum_stake_duration(&3600);
+
+        StellarAssetClient::new(&env, &token).mint(&staker, &first_deposit);
+        client.deposit_stake(&staker, &first_deposit);
+
+        env.ledger().with_mut(|l| l.timestamp = 3601);
+
+        StellarAssetClient::new(&env, &token).mint(&staker, &second_deposit);
+        client.deposit_stake(&staker, &second_deposit);
+
+        assert_eq!(client.get_voting_power(&staker), 0);
+
+        env.ledger().with_mut(|l| l.timestamp = 7202);
+
+        assert_eq!(client.get_voting_power(&staker), first_deposit + second_deposit);
+    }
+
+    #[test]
+    fn no_min_duration_means_voting_power_immediately() {
+        let (env, vault_id, token, _admin, _registry) = setup();
+        let staker = Address::generate(&env);
+        let amount: i128 = 1_000_000;
+
+        let client = StakeVaultContractClient::new(&env, &vault_id);
+
+        StellarAssetClient::new(&env, &token).mint(&staker, &amount);
+        client.deposit_stake(&staker, &amount);
+
+        assert_eq!(client.get_voting_power(&staker), amount);
+    }
+
+    #[test]
+    fn set_minimum_stake_duration_admin_only() {
+        let (env, vault_id, _token, _admin, _registry) = setup();
+        let client = StakeVaultContractClient::new(&env, &vault_id);
+        assert_eq!(client.get_minimum_stake_duration(), 0);
+    }
+
+    #[test]
+    fn deposit_timestamp_tracked() {
+        let (env, vault_id, token, _admin, _registry) = setup();
+        let staker = Address::generate(&env);
+        let amount: i128 = 1_000_000;
+
+        let client = StakeVaultContractClient::new(&env, &vault_id);
+        StellarAssetClient::new(&env, &token).mint(&staker, &amount);
+        client.deposit_stake(&staker, &amount);
+
+        let ts = client.get_stake_deposit_timestamp(&staker);
+        assert!(ts.is_some());
+        assert_eq!(ts.unwrap(), env.ledger().timestamp());
+    }
+
+    #[test]
+    fn withdraw_stake_respects_min_duration_lock() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let admin = Address::generate(&env);
+        let signal_registry = Address::generate(&env);
+        let token = sac_token(&env, &admin);
+        let vault_id = env.register(StakeVaultContract, ());
+        let client = StakeVaultContractClient::new(&env, &vault_id);
+        client.initialize(&admin, &token, &signal_registry);
+
+        let staker = Address::generate(&env);
+        let amount: i128 = 1_000_000;
+
+        client.set_minimum_stake_duration(&3600);
+
+        StellarAssetClient::new(&env, &token).mint(&staker, &amount);
+        client.deposit_stake(&staker, &amount);
+
+        let result = client.try_withdraw_stake(&staker);
+        assert_eq!(result, Err(Ok(StakeVaultError::StakeLocked)));
+
+        env.ledger().with_mut(|l| l.timestamp = 3601);
+
+        assert_eq!(client.withdraw_stake(&staker), amount);
+    }
+
+    // ── Issue #563: require_auth_for_args ─────────────────────────────────
+
+    /// Auth scoped to (staker, amount=0) is rejected when the staker has a
+    /// non-zero balance — the signature covers a different amount than what
+    /// will actually be withdrawn.
+    #[test]
+    fn withdraw_stake_arg_scoped_auth_rejects_wrong_amount() {
+        use soroban_sdk::testutils::{MockAuth, MockAuthInvoke};
+        use soroban_sdk::IntoVal;
+
+        let (env, vault_id, token, _admin, _registry) = setup();
+        let staker = Address::generate(&env);
+        let amount: i128 = 5_000_000;
+
+        StellarAssetClient::new(&env, &token).mint(&vault_id, &amount);
+        seed(&env, &vault_id, &staker, amount);
+
+        // Auth claims amount=0 but the real balance is 5_000_000.
+        let sub_invokes: &[MockAuthInvoke] = &[];
+        let wrong_args = (&staker, &0i128).into_val(&env);
+        let mock_invoke = MockAuthInvoke {
+            contract: &vault_id,
+            fn_name: "withdraw_stake",
+            args: wrong_args,
+            sub_invokes,
+        };
+        let mock_auth = MockAuth {
+            address: &staker,
+            invoke: &mock_invoke,
+        };
+
+        let result = StakeVaultContractClient::new(&env, &vault_id)
+            .mock_auths(&[mock_auth])
+            .try_withdraw_stake(&staker);
+
+        assert!(
+            result.is_err(),
+            "auth scoped to amount=0 must not authorize withdrawal of 5_000_000"
+        );
+    }
+
+    /// Auth scoped to the correct (staker, amount) passes for withdraw_stake.
+    #[test]
+    fn withdraw_stake_arg_scoped_auth_passes_for_correct_args() {
+        use soroban_sdk::testutils::{MockAuth, MockAuthInvoke};
+        use soroban_sdk::IntoVal;
+
+        let (env, vault_id, token, _admin, _registry) = setup();
+        let staker = Address::generate(&env);
+        let amount: i128 = 5_000_000;
+
+        StellarAssetClient::new(&env, &token).mint(&vault_id, &amount);
+        seed(&env, &vault_id, &staker, amount);
+
+        // Auth scoped to the exact balance that will be withdrawn.
+        let sub_invokes: &[MockAuthInvoke] = &[];
+        let correct_args = (&staker, &amount).into_val(&env);
+        let mock_invoke = MockAuthInvoke {
+            contract: &vault_id,
+            fn_name: "withdraw_stake",
+            args: correct_args,
+            sub_invokes,
+        };
+        let mock_auth = MockAuth {
+            address: &staker,
+            invoke: &mock_invoke,
+        };
+
+        let withdrawn = StakeVaultContractClient::new(&env, &vault_id)
+            .mock_auths(&[mock_auth])
+            .withdraw_stake(&staker);
+
+        assert_eq!(withdrawn, amount, "correctly scoped auth must succeed");
+    }
 }

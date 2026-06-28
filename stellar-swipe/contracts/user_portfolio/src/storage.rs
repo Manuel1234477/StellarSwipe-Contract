@@ -48,4 +48,13 @@ pub enum DataKey {
     SignalRegistry,
     /// Per-user signal watchlist (Issue: signal watchlist).
     Watchlist(Address),
+    UserOnboardingStatus(Address),
+    UserOnboardingMilestone(Address),
+    /// Per-user custom string tags on positions (Issue #703).
+    /// Maps (user, position_id) -> tag string.
+    PositionTag(Address, u64),
+    /// Per-user map of tag -> Vec<position_id> for reverse lookup (Issue #703).
+    /// Maps (user, tag_string_hash) -> Vec<position_id>.
+    /// Tags are bounded to a reasonable length to prevent spam.
+    UserPositionsByTag(Address, soroban_sdk::String),
 }

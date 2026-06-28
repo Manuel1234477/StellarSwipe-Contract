@@ -10,6 +10,7 @@ use stellar_swipe_common::Asset;
 
 use crate::{
     set_pending_fees, set_treasury_balance, ContractError, FeeCollector, FeeCollectorClient,
+    MAX_AUDIT_TOKENS,
 };
 
 /// Pre-mark a trader as having already completed their first trade,
@@ -18,6 +19,11 @@ fn mark_trader_has_traded(env: &Env, contract_id: &Address, trader: &Address) {
     env.as_contract(contract_id, || {
         crate::storage::set_has_traded(env, trader);
     });
+}
+
+/// Disable revenue-share diversion so treasury assertions reflect fee minus burn only.
+fn disable_revenue_share(client: &FeeCollectorClient<'_>) {
+    client.set_revenue_share_rate_bps(&0u32);
 }
 
 // Stellar burn address (all-zeros public key encoded as strkey)
@@ -439,6 +445,7 @@ fn test_collect_fee_tracks_volume_and_applies_rebate_tiers() {
     let (oracle_id, asset) = setup_oracle(&env, 10_000_000);
     client.set_oracle_contract(&oracle_id);
     client.set_fee_rate(&30u32);
+    disable_revenue_share(&client);
 
     StellarAssetClient::new(&env, &token).mint(&trader, &(100_000 * 10_000_000));
 
@@ -514,6 +521,7 @@ fn test_collect_fee_requires_configured_oracle() {
     client.initialize(&admin);
 
     StellarAssetClient::new(&env, &token).mint(&trader, &(1_000 * 10_000_000));
+    mark_trader_has_traded(&env, &contract_id, &trader);
     let result = client.try_collect_fee(&trader, &token, &(1_000 * 10_000_000), &trade_asset(&env));
 
     assert_eq!(result, Err(Ok(ContractError::OracleNotConfigured)));
@@ -696,6 +704,7 @@ fn test_collect_fee_burn_amount_calculation() {
     client.set_oracle_contract(&oracle_id);
     client.set_fee_rate(&30u32);
     client.set_burn_rate(&1_000u32); // 10%
+    disable_revenue_share(&client);
 
     let trade_amount: i128 = 1_000_000;
     StellarAssetClient::new(&env, &token).mint(&trader, &trade_amount);
@@ -729,6 +738,7 @@ fn test_collect_fee_zero_burn_rate_full_treasury() {
     client.set_oracle_contract(&oracle_id);
     client.set_fee_rate(&30u32);
     client.set_burn_rate(&0u32);
+    disable_revenue_share(&client);
 
     let trade_amount: i128 = 1_000_000;
     StellarAssetClient::new(&env, &token).mint(&trader, &trade_amount);
@@ -942,6 +952,7 @@ fn test_burn_rounds_down_no_dust() {
     // fee_rate=30 bps, trade_amount=1_000_001 → fee = 1_000_001*30/10_000 = 3000 (truncated)
     client.set_fee_rate(&30u32);
     client.set_burn_rate(&1_000u32); // 10%
+    disable_revenue_share(&client);
 
     let trade_amount: i128 = 1_000_001;
     StellarAssetClient::new(&env, &token).mint(&trader, &trade_amount);
@@ -980,11 +991,13 @@ fn test_no_unwithdrawable_dust_accumulates() {
     client.set_oracle_contract(&oracle_id);
     client.set_fee_rate(&30u32);
     client.set_burn_rate(&3_333u32); // 33.33% — non-round to stress remainder
+    disable_revenue_share(&client);
 
     // Use a trade amount that produces a non-round fee
     let trade_amount: i128 = 777_777;
     StellarAssetClient::new(&env, &token).mint(&trader, &trade_amount);
 
+    mark_trader_has_traded(&env, &contract_id, &trader);
     let fee = client.collect_fee(&trader, &token, &trade_amount, &asset);
     // fee = 777_777 * 30 / 10_000 = 2333 (truncated)
     assert_eq!(fee, 2_333);
@@ -1021,6 +1034,7 @@ fn test_fee_rounded_to_zero_error() {
     let trade_amount: i128 = 9_999;
     StellarAssetClient::new(&env, &token).mint(&trader, &trade_amount);
 
+    mark_trader_has_traded(&env, &contract_id, &trader);
     let result = client.try_collect_fee(&trader, &token, &trade_amount, &asset);
     assert_eq!(result, Err(Ok(ContractError::FeeRoundedToZero)));
 }
@@ -1053,6 +1067,7 @@ fn test_collect_fee_overflow_returns_error() {
 
     // i128::MAX * 30 overflows — checked_mul returns None → ArithmeticOverflow
     StellarAssetClient::new(&env, &token).mint(&trader, &i128::MAX);
+    mark_trader_has_traded(&env, &contract_id, &trader);
     let result = client.try_collect_fee(&trader, &token, &i128::MAX, &asset);
     assert_eq!(result, Err(Ok(ContractError::ArithmeticOverflow)));
 }
@@ -1155,7 +1170,7 @@ fn test_audit_balances_no_mismatch() {
     let (token, _contract_id, client) = setup_audit(&env, 1_000i128);
 
     let tokens = soroban_sdk::vec![&env, token.clone()];
-    let mismatches = client.audit_balances(&tokens).unwrap();
+    let mismatches = client.audit_balances(&tokens);
 
     // Stored balance equals on-chain balance: no mismatches
     assert_eq!(mismatches.len(), 0);
@@ -1172,7 +1187,7 @@ fn test_audit_balances_detects_surplus() {
     StellarAssetClient::new(&env, &token).mint(&contract_id, &500i128);
 
     let tokens = soroban_sdk::vec![&env, token.clone()];
-    let mismatches = client.audit_balances(&tokens).unwrap();
+    let mismatches = client.audit_balances(&tokens);
 
     assert_eq!(mismatches.len(), 1);
     let m = mismatches.get(0).unwrap();
@@ -1195,7 +1210,7 @@ fn test_audit_balances_detects_deficit() {
     });
 
     let tokens = soroban_sdk::vec![&env, token.clone()];
-    let mismatches = client.audit_balances(&tokens).unwrap();
+    let mismatches = client.audit_balances(&tokens);
 
     assert_eq!(mismatches.len(), 1);
     let m = mismatches.get(0).unwrap();
@@ -1233,7 +1248,7 @@ fn test_audit_balances_multiple_tokens() {
     });
 
     let tokens = soroban_sdk::vec![&env, token_a.clone(), token_b.clone()];
-    let mismatches = client.audit_balances(&tokens).unwrap();
+    let mismatches = client.audit_balances(&tokens);
 
     // Only token B should appear
     assert_eq!(mismatches.len(), 1);
@@ -1259,3 +1274,132 @@ fn test_audit_balances_not_initialized() {
     let result = client.try_audit_balances(&tokens);
     assert_eq!(result, Err(Ok(ContractError::NotInitialized)));
 }
+
+#[test]
+fn test_audit_balances_limit_at_limit() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (_recipient, _token, _contract_id, client) = setup(&env, 1000);
+
+    let mut tokens = soroban_sdk::Vec::new(&env);
+    for _ in 0..MAX_AUDIT_TOKENS {
+        let token = env
+            .register_stellar_asset_contract_v2(Address::generate(&env))
+            .address();
+        tokens.push_back(token);
+    }
+
+    let result = client.try_audit_balances(&tokens);
+    assert!(result.is_ok());
+}
+
+#[test]
+fn test_audit_balances_limit_over_limit() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (_recipient, _token, _contract_id, client) = setup(&env, 1000);
+
+    let mut tokens = soroban_sdk::Vec::new(&env);
+    for _ in 0..=MAX_AUDIT_TOKENS {
+        let token = env
+            .register_stellar_asset_contract_v2(Address::generate(&env))
+            .address();
+        tokens.push_back(token);
+    }
+
+    let result = client.try_audit_balances(&tokens);
+    assert_eq!(result, Err(Ok(ContractError::IterationLimitExceeded)));
+}
+
+// ── Issue #563: require_auth_for_args ─────────────────────────────────────
+
+/// A valid claim_fees auth for (provider, token_A) must be rejected when the
+/// caller substitutes token_B — demonstrating that require_auth_for_args
+/// scopes the signature to the exact (provider, token) pair.
+#[test]
+fn test_claim_fees_arg_scoped_auth_rejects_substituted_token() {
+    use soroban_sdk::testutils::{MockAuth, MockAuthInvoke};
+    use soroban_sdk::IntoVal;
+
+    let env = Env::default();
+
+    let admin = Address::generate(&env);
+    let provider = Address::generate(&env);
+
+    let token_a = env
+        .register_stellar_asset_contract_v2(Address::generate(&env))
+        .address();
+    let token_b = env
+        .register_stellar_asset_contract_v2(Address::generate(&env))
+        .address();
+
+    let contract_id = env.register(FeeCollector, ());
+    let client = FeeCollectorClient::new(&env, &contract_id);
+    env.mock_all_auths();
+    client.initialize(&admin);
+
+    // Provider signs for (provider, token_a) but the call targets token_b.
+    let sub_invokes: &[MockAuthInvoke] = &[];
+    let mock_invoke = MockAuthInvoke {
+        contract: &contract_id,
+        fn_name: "claim_fees",
+        args: (&provider, &token_a).into_val(&env),
+        sub_invokes,
+    };
+    let mock_auth = MockAuth {
+        address: &provider,
+        invoke: &mock_invoke,
+    };
+
+    // The call uses token_b but the auth only covers token_a — must fail.
+    let result = client
+        .mock_auths(&[mock_auth])
+        .try_claim_fees(&provider, &token_b);
+
+    assert!(
+        result.is_err(),
+        "auth scoped to token_a must not authorize a claim for token_b"
+    );
+}
+
+/// A valid claim_fees auth scoped to the correct (provider, token) succeeds.
+#[test]
+fn test_claim_fees_arg_scoped_auth_passes_for_correct_args() {
+    use soroban_sdk::testutils::{MockAuth, MockAuthInvoke};
+    use soroban_sdk::IntoVal;
+
+    let env = Env::default();
+
+    let admin = Address::generate(&env);
+    let provider = Address::generate(&env);
+
+    let token = env
+        .register_stellar_asset_contract_v2(Address::generate(&env))
+        .address();
+
+    let contract_id = env.register(FeeCollector, ());
+    let client = FeeCollectorClient::new(&env, &contract_id);
+    env.mock_all_auths();
+    client.initialize(&admin);
+
+    // Auth exactly matches the call arguments.
+    let sub_invokes: &[MockAuthInvoke] = &[];
+    let mock_invoke = MockAuthInvoke {
+        contract: &contract_id,
+        fn_name: "claim_fees",
+        args: (&provider, &token).into_val(&env),
+        sub_invokes,
+    };
+    let mock_auth = MockAuth {
+        address: &provider,
+        invoke: &mock_invoke,
+    };
+
+    let result = client
+        .mock_auths(&[mock_auth])
+        .try_claim_fees(&provider, &token);
+
+    assert!(result.is_ok(), "correctly scoped auth must succeed");
+}
+
+

@@ -162,6 +162,7 @@ dependencies = [
 name = "auto_trade"
 version = "0.0.0"
 dependencies = [
+ "shared",
  "soroban-sdk",
  "stellar_swipe_common",
 ]
@@ -203,6 +204,14 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3078c7629b62d3f0439517fa394996acacc5cbc91c5a20d8c658e77abd503a71"
 dependencies = [
  "generic-array",
+]
+
+[[package]]
+name = "bridge"
+version = "0.1.0"
+dependencies = [
+ "soroban-sdk",
+ "stellar_swipe_common",
 ]
 
 [[package]]
@@ -318,19 +327,13 @@ dependencies = [
 
 [[package]]
 name = "ctor"
-version = "0.5.0"
+version = "0.2.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "67773048316103656a637612c4a62477603b777d91d9c62ff2290f9cde178fdb"
+checksum = "32a2785755761f3ddc1492979ce1e48d2c00d09311c39e4466429188f3dd6501"
 dependencies = [
- "ctor-proc-macro",
- "dtor",
+ "quote",
+ "syn 2.0.114",
 ]
-
-[[package]]
-name = "ctor-proc-macro"
-version = "0.0.6"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e2931af7e13dc045d8e9d26afccc6fa115d64e115c9c84b1166288b46f6782c2"
 
 [[package]]
 name = "curve25519-dalek"
@@ -490,25 +493,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "dlmalloc"
+version = "0.2.14"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ad5208a115eaba24916f7456929832e310a81518c641f93fee4f89aa93aa3675"
+dependencies = [
+ "cfg-if",
+ "libc",
+ "windows-sys",
+]
+
+[[package]]
 name = "downcast-rs"
 version = "1.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "75b325c5dbd37f80359721ad39aca5a29fb04c89279657cffdda8736d0c0b9d2"
-
-[[package]]
-name = "dtor"
-version = "0.1.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "404d02eeb088a82cfd873006cb713fe411306c7d182c344905e101fb1167d301"
-dependencies = [
- "dtor-proc-macro",
-]
-
-[[package]]
-name = "dtor-proc-macro"
-version = "0.0.6"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f678cf4a922c215c63e0de95eb1ff08a958a81d47e485cf9da1e27bf6305cfa5"
 
 [[package]]
 name = "dyn-clone"
@@ -807,6 +806,7 @@ dependencies = [
  "signal_registry",
  "soroban-sdk",
  "stake_vault",
+ "stellar_swipe_common",
 ]
 
 [[package]]
@@ -1336,6 +1336,7 @@ checksum = "0fda2ff0d084019ba4d7c6f371c95d8fd75ce3524c3cb8fb653a3023f6323e64"
 name = "signal_registry"
 version = "0.0.0"
 dependencies = [
+ "dlmalloc",
  "shared",
  "soroban-sdk",
  "stellar_swipe_common",
@@ -1465,9 +1466,9 @@ dependencies = [
 
 [[package]]
 name = "soroban-sdk"
-version = "23.4.1"
+version = "23.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c98b52fc08da8e0edf29233f8c195c5500404139ba68026d4e717931bd354987"
+checksum = "dbb6db5590284b7c4b7c9f7f733451a936eb4cbecc859000427240f8b5578b8e"
 dependencies = [
  "arbitrary",
  "bytes-lit",
@@ -1484,7 +1485,6 @@ dependencies = [
  "soroban-ledger-snapshot",
  "soroban-sdk-macros",
  "stellar-strkey",
- "visibility",
 ]
 
 [[package]]
@@ -1568,7 +1568,9 @@ dependencies = [
 name = "stake_vault"
 version = "0.0.0"
 dependencies = [
+ "shared",
  "soroban-sdk",
+ "stellar_swipe_common",
 ]
 
 [[package]]
@@ -1610,6 +1612,7 @@ dependencies = [
 name = "stellar_swipe_common"
 version = "0.0.0"
 dependencies = [
+ "shared",
  "soroban-sdk",
 ]
 
@@ -1741,17 +1744,6 @@ name = "version_check"
 version = "0.9.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
-
-[[package]]
-name = "visibility"
-version = "0.1.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d674d135b4a8c1d7e813e2f8d1c9a58308aee4a680323066025e53132218bd91"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn 2.0.114",
-]
 
 [[package]]
 name = "wasi"
@@ -1905,6 +1897,15 @@ name = "windows-strings"
 version = "0.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7837d08f69c77cf6b07689544538e017c1bfcf57e34b4c0ff58e6c2cd3b37091"
+dependencies = [
+ "windows-link",
+]
+
+[[package]]
+name = "windows-sys"
+version = "0.61.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ae137229bcbd6cdf0f7b80a31df61766145077ddf49416a728b02cb3921ff3fc"
 dependencies = [
  "windows-link",
 ]

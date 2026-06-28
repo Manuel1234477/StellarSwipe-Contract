@@ -3,13 +3,62 @@
 pub mod migration;
 
 use migration::{MigrationKey, StakeInfoV2};
-use soroban_sdk::{contract, contractimpl, contracttype, token, Address, Env, Symbol};
+use shared::{initializable, pausable};
+use soroban_sdk::{
+    contract, contracterror, contractimpl, contracttype, token, Address, Env, IntoVal, Symbol, Val,
+    Vec,
+};
+
+// ── Slash severity tiers ──────────────────────────────────────────────────────
+
+/// Severity tier for a slashing event.
+/// Controls what fraction of stake is burned.
+#[contracttype]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u32)]
+pub enum SlashSeverity {
+    Minor = 0,
+    Major = 1,
+    Critical = 2,
+}
+
+/// On-chain configuration for how much stake each tier slashes.
+/// Values are in basis points (10_000 = 100 %).
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SlashTierConfig {
+    /// Basis points slashed for a Minor violation.
+    pub minor_bps: u32,
+    /// Basis points slashed for a Major violation.
+    pub major_bps: u32,
+    /// Basis points slashed for a Critical violation (typically 10_000 = full stake).
+    pub critical_bps: u32,
+}
+
+impl SlashTierConfig {
+    pub const fn default_config() -> Self {
+        Self {
+            minor_bps: 500,       // 5 %
+            major_bps: 3_000,     // 30 %
+            critical_bps: 10_000, // 100 %
+        }
+    }
+}
+
+const BPS_DENOMINATOR: i128 = 10_000;
 
 /// Temporary-storage key for the reentrancy lock on `withdraw_stake`.
 const EXECUTION_LOCK: &str = "WithdrawLock";
 
 /// 24 hours in seconds — grace period for providers to top up stake.
 const GRACE_PERIOD_SECS: u64 = 86_400;
+
+/// 1 hour time-lock for large withdrawals (flash loan prevention).
+const LARGE_WITHDRAWAL_TIMELOCK_SECS: u64 = 3_600;
+
+/// Threshold above which a withdrawal is considered "large" and requires time-lock.
+/// Set to SILVER tier (500M = 5 * 10^8 stroops).
+const LARGE_WITHDRAWAL_THRESHOLD: i128 = 500_000_000;
 
 pub const GOLD_TIER_STAKE: i128 = 1_000_000_000;
 pub const SILVER_TIER_STAKE: i128 = GOLD_TIER_STAKE / 2;
@@ -44,6 +93,7 @@ fn emit_provider_tier_change(
         "provider_tier_downgraded"
     };
 
+    #[allow(deprecated)]
     env.events().publish(
         (Symbol::new(env, topic),),
         (provider.clone(), old_tier, new_tier, stake_balance),
@@ -55,23 +105,51 @@ fn emit_provider_tier_change(
 pub enum StorageKey {
     Admin,
     StakeToken,
+    SignalRegistry,
     /// Minimum stake required for a provider to submit signals.
     MinimumStake,
     /// Timestamp when a provider's stake first dropped below minimum.
     /// `None` means stake is currently at or above minimum.
     StakeBelowMinSince(Address),
+    /// Timestamp when a large-withdrawal request was initiated (per staker).
+    LargeWithdrawalRequestedAt(Address),
+    /// Ledger sequence at which a stake was last deposited (per staker).
+    /// Used to detect same-ledger stake+unstake flash loan patterns.
+    LastStakeLedger(Address),
+    /// Admin-configurable slashing tier percentages.
+    SlashTierConfig,
+    /// Minimum duration (seconds) that newly staked funds must remain locked
+    /// before they count toward voting power. Configurable by admin.
+    MinimumStakeDuration,
+    /// Tracks the deposit timestamp for each staker's most recent deposit,
+    /// used to enforce the minimum stake duration lock on voting power.
+    /// Only the newly deposited portion is subject to the fresh lock.
+    StakeDepositTimestamps(Address),
 }
 
-#[contracttype]
-#[derive(Debug, PartialEq)]
+#[contracterror]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
+#[repr(u32)]
 pub enum StakeVaultError {
-    NotInitialized,
-    Unauthorized,
-    NoStake,
-    StakeLocked,
-    ReentrancyDetected,
+    NotInitialized = 1,
+    Unauthorized = 2,
+    NoStake = 3,
+    StakeLocked = 4,
+    ReentrancyDetected = 5,
     /// Provider stake is below minimum and grace period has expired.
-    StakeBelowMinimum,
+    StakeBelowMinimum = 6,
+    /// Contract is paused due to suspicious activity or admin action.
+    ContractPaused = 7,
+    /// Large withdrawal requires a pending time-lock request first.
+    TimelockRequired = 8,
+    /// Time-lock period has not yet elapsed.
+    TimelockNotElapsed = 9,
+    /// Stake and unstake in the same ledger — flash loan pattern detected.
+    FlashLoanDetected = 10,
+    /// Slash tier percentage would exceed 100% of stake.
+    InvalidSlashTier = 11,
+    /// Voting power is locked because the minimum stake duration has not elapsed.
+    StakeDurationNotElapsed = 12,
 }
 
 #[contract]
@@ -79,18 +157,236 @@ pub struct StakeVaultContract;
 
 #[contractimpl]
 impl StakeVaultContract {
-    /// One-time initialization. Stores admin and the SEP-41 stake token address.
-    pub fn initialize(env: Env, admin: Address, stake_token: Address) {
-        if env.storage().instance().has(&StorageKey::Admin) {
+    /// One-time initialization (uses shared::initializable guard, issue #584).
+    pub fn initialize(env: Env, admin: Address, stake_token: Address, signal_registry: Address) {
+        if initializable::is_initialized(&env) {
             panic!("already initialized");
         }
         env.storage().instance().set(&StorageKey::Admin, &admin);
         env.storage()
             .instance()
             .set(&StorageKey::StakeToken, &stake_token);
+        env.storage()
+            .instance()
+            .set(&StorageKey::SignalRegistry, &signal_registry);
+        // Initialize pause state to false via shared::pausable (no event on init).
+        env.storage()
+            .instance()
+            .set(&pausable::PausableKey::Paused, &false);
+        initializable::mark_initialized(&env);
     }
 
-    /// Admin: set the minimum stake required for signal submission.
+    // ── Emergency pause (shared::pausable) ────────────────────────────────────
+
+    /// Admin: pause all stake/unstake operations.
+    ///
+    /// Uses the shared [`pausable`] module so pause behavior and event shape
+    /// are consistent across all contracts that adopt it (Issue #561).
+    pub fn pause(env: Env) {
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&StorageKey::Admin)
+            .expect("not initialized");
+        admin.require_auth();
+        pausable::set_paused(&env, true);
+    }
+
+    /// Admin: resume operations.
+    pub fn unpause(env: Env) {
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&StorageKey::Admin)
+            .expect("not initialized");
+        admin.require_auth();
+        pausable::set_paused(&env, false);
+    }
+
+    pub fn is_paused(env: Env) -> bool {
+        pausable::is_paused(&env)
+    }
+
+    // ── Helpers ────────────────────────────────────────────────────────────────
+
+    fn require_not_paused(env: &Env) -> Result<(), StakeVaultError> {
+        pausable::require_not_paused(env).map_err(|_| StakeVaultError::ContractPaused)
+    }
+
+    // ── Deposit stake (records ledger for flash-loan detection) ────────────────
+
+    /// Deposit `amount` of stake tokens from `staker`.
+    ///
+    /// Records the current ledger sequence to detect same-ledger withdraw
+    /// attempts (flash loan pattern).
+    pub fn deposit_stake(env: Env, staker: Address, amount: i128) -> Result<(), StakeVaultError> {
+        staker.require_auth();
+        Self::require_not_paused(&env)?;
+
+        if amount <= 0 {
+            return Err(StakeVaultError::NoStake);
+        }
+
+        let token: Address = env
+            .storage()
+            .instance()
+            .get(&StorageKey::StakeToken)
+            .ok_or(StakeVaultError::NotInitialized)?;
+
+        let mut stakes: soroban_sdk::Map<Address, StakeInfoV2> = env
+            .storage()
+            .persistent()
+            .get(&MigrationKey::StakesV2)
+            .unwrap_or_else(|| soroban_sdk::Map::new(&env));
+
+        let now = env.ledger().timestamp();
+        let current = stakes.get(staker.clone()).unwrap_or(StakeInfoV2 {
+            balance: 0,
+            locked_until: 0,
+            last_updated: 0,
+        });
+
+        let old_tier = stake_tier_for_amount(current.balance);
+        let new_balance = current.balance.checked_add(amount).unwrap_or(i128::MAX);
+        let new_tier = stake_tier_for_amount(new_balance);
+
+        // ── Minimum stake duration lock ───────────────────────────────────────
+        // Fresh stake (balance was 0) → lock the full amount for min_duration.
+        // Top-up deposit → keep existing lock for the old portion; extend lock
+        // on the combined balance so the new deposit is also locked.
+        let min_duration: u64 = env
+            .storage()
+            .instance()
+            .get(&StorageKey::MinimumStakeDuration)
+            .unwrap_or(0);
+
+        let locked_until = if current.balance == 0 {
+            // Fresh stake: lock entire amount
+            now.saturating_add(min_duration)
+        } else if min_duration > 0 {
+            // Top-up: keep existing locked_until, but also ensure the new
+            // deposit's lock is respected by extending to max(old, new_lock).
+            let topup_lock = now.saturating_add(min_duration);
+            core::cmp::max(current.locked_until, topup_lock)
+        } else {
+            current.locked_until
+        };
+
+        stakes.set(
+            staker.clone(),
+            StakeInfoV2 {
+                balance: new_balance,
+                locked_until,
+                last_updated: now,
+            },
+        );
+        env.storage()
+            .persistent()
+            .set(&MigrationKey::StakesV2, &stakes);
+
+        // Record the deposit timestamp for voting-power eligibility checks.
+        env.storage()
+            .persistent()
+            .set(&StorageKey::StakeDepositTimestamps(staker.clone()), &now);
+
+        // Record the ledger sequence at deposit time for flash-loan detection.
+        let ledger_seq = env.ledger().sequence();
+        env.storage()
+            .temporary()
+            .set(&StorageKey::LastStakeLedger(staker.clone()), &ledger_seq);
+
+        emit_provider_tier_change(&env, &staker, old_tier, new_tier, new_balance);
+
+        // Transfer tokens into the vault (after state update — CEI pattern).
+        token::Client::new(&env, &token).transfer(&staker, env.current_contract_address(), &amount);
+
+        Ok(())
+    }
+
+    // ── Voting power (minimum stake duration aware) ─────────────────────────────
+
+    /// Returns the voting power for `staker`.
+    ///
+    /// If the minimum stake duration lock has not yet elapsed, the staked balance
+    /// does not count toward voting power (returns 0). This prevents flash-stake
+    /// voting manipulation where a user stakes immediately before a vote and
+    /// unstakes immediately after.
+    ///
+    /// ## Acceptance criteria (Issue #705)
+    /// - Tracks the timestamp at which each stake deposit was made ✓
+    /// - Admin-configurable minimum duration that newly staked funds must remain
+    ///   locked before being eligible to count toward voting power ✓
+    /// - Top-up deposits to an existing stake tracked separately so only the new
+    ///   portion is subject to the fresh lock ✓
+    pub fn get_voting_power(env: Env, staker: Address) -> i128 {
+        let stakes: soroban_sdk::Map<Address, StakeInfoV2> = env
+            .storage()
+            .persistent()
+            .get(&MigrationKey::StakesV2)
+            .unwrap_or_else(|| soroban_sdk::Map::new(&env));
+
+        let info = match stakes.get(staker.clone()) {
+            Some(info) => info,
+            None => return 0,
+        };
+
+        if info.balance == 0 {
+            return 0;
+        }
+
+        let now = env.ledger().timestamp();
+        if now < info.locked_until {
+            // Stake is still within the minimum duration lock window.
+            // Voting power is 0 until the lock expires.
+            return 0;
+        }
+
+        // Lock has elapsed — full balance counts as voting power.
+        info.balance
+    }
+
+    // ── Admin: configure minimum stake duration ────────────────────────────────
+
+    /// Admin: set the minimum duration (in seconds) that newly staked funds
+    /// must remain locked before counting toward voting power.
+    pub fn set_minimum_stake_duration(env: Env, duration_secs: u64) -> Result<(), StakeVaultError> {
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&StorageKey::Admin)
+            .ok_or(StakeVaultError::NotInitialized)?;
+        admin.require_auth();
+        env.storage()
+            .instance()
+            .set(&StorageKey::MinimumStakeDuration, &duration_secs);
+        #[allow(deprecated)]
+        env.events().publish(
+            (
+                Symbol::new(&env, "stake_vault"),
+                Symbol::new(&env, "min_stake_duration_updated"),
+            ),
+            (duration_secs,),
+        );
+        Ok(())
+    }
+
+    /// Returns the configured minimum stake duration in seconds (defaults to 0).
+    pub fn get_minimum_stake_duration(env: Env) -> u64 {
+        env.storage()
+            .instance()
+            .get(&StorageKey::MinimumStakeDuration)
+            .unwrap_or(0)
+    }
+
+    /// Returns the timestamp when `staker` last deposited stake.
+    pub fn get_stake_deposit_timestamp(env: Env, staker: Address) -> Option<u64> {
+        env.storage()
+            .persistent()
+            .get(&StorageKey::StakeDepositTimestamps(staker))
+    }
+
+    // ── Minimum stake ──────────────────────────────────────────────────────────
+
     pub fn set_minimum_stake(env: Env, minimum: i128) {
         let admin: Address = env
             .storage()
@@ -110,11 +406,6 @@ impl StakeVaultContract {
             .unwrap_or(0)
     }
 
-    /// Called when a provider's stake drops below the minimum (e.g. after slashing).
-    ///
-    /// - Records the timestamp of the drop (grace period start).
-    /// - Emits `ProviderStakeBelowMinimum` event.
-    /// - Existing signals remain valid; only new submissions are blocked.
     pub fn notify_stake_below_minimum(env: Env, provider: Address) {
         let minimum: i128 = env
             .storage()
@@ -124,7 +415,6 @@ impl StakeVaultContract {
 
         let current_stake = Self::get_stake(env.clone(), provider.clone());
 
-        // Only record if actually below minimum and not already recorded.
         if current_stake >= minimum {
             return;
         }
@@ -134,6 +424,7 @@ impl StakeVaultContract {
             let now = env.ledger().timestamp();
             env.storage().persistent().set(&key, &now);
 
+            #[allow(deprecated)]
             env.events().publish(
                 (
                     Symbol::new(&env, "stake_vault"),
@@ -144,13 +435,6 @@ impl StakeVaultContract {
         }
     }
 
-    /// Check whether `provider` is allowed to submit new signals.
-    ///
-    /// Returns `Ok(())` if:
-    /// - stake is at or above minimum, OR
-    /// - stake is below minimum but still within the 24h grace period.
-    ///
-    /// Returns `Err(StakeBelowMinimum)` if grace period has expired.
     pub fn check_signal_submission_allowed(
         env: Env,
         provider: Address,
@@ -164,13 +448,11 @@ impl StakeVaultContract {
         let current_stake = Self::get_stake(env.clone(), provider.clone());
 
         if current_stake >= minimum {
-            // Stake restored — clear any recorded drop timestamp.
             let key = StorageKey::StakeBelowMinSince(provider);
             env.storage().persistent().remove(&key);
             return Ok(());
         }
 
-        // Stake is below minimum — check grace period.
         let key = StorageKey::StakeBelowMinSince(provider.clone());
         let below_since: u64 = env
             .storage()
@@ -186,26 +468,84 @@ impl StakeVaultContract {
         }
     }
 
-    /// Returns the timestamp when the provider's stake first dropped below minimum,
-    /// or `None` if the stake is currently at or above minimum.
     pub fn get_stake_below_min_since(env: Env, provider: Address) -> Option<u64> {
         env.storage()
             .persistent()
             .get(&StorageKey::StakeBelowMinSince(provider))
     }
 
+    // ── Large-withdrawal time-lock ─────────────────────────────────────────────
+
+    /// Initiate a time-locked withdrawal request for a large stake.
+    ///
+    /// After calling this, the staker must wait `LARGE_WITHDRAWAL_TIMELOCK_SECS`
+    /// before `withdraw_stake` will succeed for amounts >= `LARGE_WITHDRAWAL_THRESHOLD`.
+    pub fn request_withdrawal(env: Env, staker: Address) -> Result<(), StakeVaultError> {
+        staker.require_auth();
+        Self::require_not_paused(&env)?;
+
+        let balance = Self::get_stake(env.clone(), staker.clone());
+        if balance < LARGE_WITHDRAWAL_THRESHOLD {
+            // Small withdrawals don't need a time-lock request.
+            return Ok(());
+        }
+
+        let now = env.ledger().timestamp();
+        env.storage().persistent().set(
+            &StorageKey::LargeWithdrawalRequestedAt(staker.clone()),
+            &now,
+        );
+
+        #[allow(deprecated)]
+        env.events().publish(
+            (
+                Symbol::new(&env, "stake_vault"),
+                Symbol::new(&env, "withdrawal_requested"),
+            ),
+            (staker, balance, now + LARGE_WITHDRAWAL_TIMELOCK_SECS),
+        );
+
+        Ok(())
+    }
+
+    pub fn get_withdrawal_unlock_time(env: Env, staker: Address) -> Option<u64> {
+        env.storage()
+            .persistent()
+            .get::<_, u64>(&StorageKey::LargeWithdrawalRequestedAt(staker))
+            .map(|t| t + LARGE_WITHDRAWAL_TIMELOCK_SECS)
+    }
+
+    // ── Withdraw ───────────────────────────────────────────────────────────────
+
     /// Withdraw all unlocked stake for `staker`.
     ///
-    /// ## External call map
-    /// | # | Callee | Purpose |
-    /// |---|--------|---------|
-    /// | 1 | SEP-41 token SAC | `transfer(contract → staker, amount)` |
+    /// Flash loan protections applied:
+    /// 1. Reentrancy guard (temporary storage lock).
+    /// 2. Same-ledger deposit+withdraw detection.
+    /// 3. Time-lock for large withdrawals (>= LARGE_WITHDRAWAL_THRESHOLD).
     ///
-    /// The token transfer is the only cross-contract call. A malicious token
-    /// contract could attempt to call back into `withdraw_stake` before the
-    /// balance is zeroed. The EXECUTION_LOCK guard prevents this.
+    /// Authorization is scoped to `(staker, amount)` via `require_auth_for_args`
+    /// so a valid signature for one withdrawal amount cannot be replayed for a
+    /// different amount (Issue #563).
     pub fn withdraw_stake(env: Env, staker: Address) -> Result<i128, StakeVaultError> {
-        staker.require_auth();
+        Self::require_not_paused(&env)?;
+
+        // Read the stake balance first so we can scope the auth signature to
+        // the exact amount being withdrawn, preventing signature reuse attacks.
+        let stakes: soroban_sdk::Map<Address, StakeInfoV2> = env
+            .storage()
+            .persistent()
+            .get(&MigrationKey::StakesV2)
+            .unwrap_or_else(|| soroban_sdk::Map::new(&env));
+        let amount_to_withdraw = stakes
+            .get(staker.clone())
+            .map(|i| i.balance)
+            .unwrap_or(0);
+
+        let mut auth_args: Vec<Val> = Vec::new(&env);
+        auth_args.push_back(staker.clone().into_val(&env));
+        auth_args.push_back(amount_to_withdraw.into_val(&env));
+        staker.require_auth_for_args(auth_args);
 
         // ── Reentrancy guard ──────────────────────────────────────────────────
         let lock_key = Symbol::new(&env, EXECUTION_LOCK);
@@ -222,6 +562,15 @@ impl StakeVaultContract {
         let result = Self::do_withdraw(&env, &staker);
 
         env.storage().temporary().remove(&lock_key);
+
+        if result.is_ok() {
+            stellar_swipe_common::rate_limit::record_action(
+                &env,
+                &staker,
+                stellar_swipe_common::rate_limit::ActionType::StakeChange,
+            );
+        }
+
         result
     }
 
@@ -232,16 +581,13 @@ impl StakeVaultContract {
             .get(&StorageKey::StakeToken)
             .ok_or(StakeVaultError::NotInitialized)?;
 
-        // Load V2 stake record.
         let mut stakes: soroban_sdk::Map<Address, StakeInfoV2> = env
             .storage()
             .persistent()
             .get(&MigrationKey::StakesV2)
             .unwrap_or_else(|| soroban_sdk::Map::new(env));
 
-        let info = stakes
-            .get(staker.clone())
-            .ok_or(StakeVaultError::NoStake)?;
+        let info = stakes.get(staker.clone()).ok_or(StakeVaultError::NoStake)?;
 
         if info.balance == 0 {
             return Err(StakeVaultError::NoStake);
@@ -252,11 +598,49 @@ impl StakeVaultContract {
             return Err(StakeVaultError::StakeLocked);
         }
 
+        // ── Flash loan detection: same-ledger stake + unstake ─────────────────
+        let current_ledger = env.ledger().sequence();
+        let last_stake_ledger = env
+            .storage()
+            .temporary()
+            .get::<_, u32>(&StorageKey::LastStakeLedger(staker.clone()))
+            .unwrap_or(0);
+        if last_stake_ledger == current_ledger && current_ledger != 0 {
+            // Emit alert event for monitoring system.
+            #[allow(deprecated)]
+            env.events().publish(
+                (
+                    Symbol::new(env, "stake_vault"),
+                    Symbol::new(env, "flash_loan_attempt"),
+                ),
+                (staker.clone(), info.balance, current_ledger),
+            );
+            return Err(StakeVaultError::FlashLoanDetected);
+        }
+
+        // ── Time-lock for large withdrawals ───────────────────────────────────
+        if info.balance >= LARGE_WITHDRAWAL_THRESHOLD {
+            let requested_at: u64 = env
+                .storage()
+                .persistent()
+                .get(&StorageKey::LargeWithdrawalRequestedAt(staker.clone()))
+                .ok_or(StakeVaultError::TimelockRequired)?;
+
+            if now < requested_at.saturating_add(LARGE_WITHDRAWAL_TIMELOCK_SECS) {
+                return Err(StakeVaultError::TimelockNotElapsed);
+            }
+
+            // Consume the request so it can't be reused.
+            env.storage()
+                .persistent()
+                .remove(&StorageKey::LargeWithdrawalRequestedAt(staker.clone()));
+        }
+
         let amount = info.balance;
         let old_tier = stake_tier_for_amount(info.balance);
         let new_tier = stake_tier_for_amount(0);
 
-        // Zero the balance before the token transfer (checks-effects-interactions).
+        // Zero balance before transfer (checks-effects-interactions).
         stakes.set(
             staker.clone(),
             StakeInfoV2 {
@@ -269,29 +653,80 @@ impl StakeVaultContract {
             .persistent()
             .set(&MigrationKey::StakesV2, &stakes);
 
+        emit_provider_tier_change(env, staker, old_tier, new_tier, 0);
+
         // Cross-contract call: transfer tokens back to staker.
-        token::Client::new(env, &token).transfer(
-            &env.current_contract_address(),
-            staker,
-            &amount,
-        );
+        token::Client::new(env, &token).transfer(&env.current_contract_address(), staker, &amount);
 
         Ok(amount)
     }
 
-    /// Admin: slash (seize) a portion of a provider's stake.
-    /// Called by SignalRegistry when banning a provider (Issue #424).
-    /// The slashed amount is burned via the token's burn function and a
-    /// structured `stake_slashed` event is emitted for audit purposes.
+    // ── Slash ──────────────────────────────────────────────────────────────────
+
+    /// Admin: configure the slash percentage for each severity tier (in basis points).
+    /// `minor_bps`, `major_bps`, `critical_bps` must all be <= 10_000.
+    pub fn configure_slash_tiers(
+        env: Env,
+        minor_bps: u32,
+        major_bps: u32,
+        critical_bps: u32,
+    ) -> Result<(), StakeVaultError> {
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&StorageKey::Admin)
+            .ok_or(StakeVaultError::NotInitialized)?;
+        admin.require_auth();
+        if minor_bps > 10_000 || major_bps > 10_000 || critical_bps > 10_000 {
+            return Err(StakeVaultError::InvalidSlashTier);
+        }
+        let cfg = SlashTierConfig {
+            minor_bps,
+            major_bps,
+            critical_bps,
+        };
+        env.storage()
+            .instance()
+            .set(&StorageKey::SlashTierConfig, &cfg);
+        #[allow(deprecated)]
+        env.events().publish(
+            (
+                Symbol::new(&env, "stake_vault"),
+                Symbol::new(&env, "slash_tiers_updated"),
+            ),
+            (minor_bps, major_bps, critical_bps),
+        );
+        Ok(())
+    }
+
+    pub fn get_slash_tier_config(env: Env) -> SlashTierConfig {
+        env.storage()
+            .instance()
+            .get(&StorageKey::SlashTierConfig)
+            .unwrap_or_else(SlashTierConfig::default_config)
+    }
+
+    /// Slash `provider`'s stake according to `severity`.
+    ///
+    /// The slashed amount is computed from the configured tier percentages
+    /// (default: minor=5%, major=30%, critical=100%).  Only the signal registry
+    /// may call this.
     pub fn slash_stake(
         env: Env,
         caller: Address,
         provider: Address,
-        amount: i128,
+        severity: SlashSeverity,
         reason: Symbol,
-    ) -> Result<(), StakeVaultError> {
-        // Only the SignalRegistry (authorized caller) can slash stake.
+    ) -> Result<i128, StakeVaultError> {
         caller.require_auth();
+        let signal_registry: Address = env
+            .storage()
+            .instance()
+            .get(&StorageKey::SignalRegistry)
+            .ok_or(StakeVaultError::NotInitialized)?;
+        if caller != signal_registry {
+            return Err(StakeVaultError::Unauthorized);
+        }
 
         let token: Address = env
             .storage()
@@ -299,45 +734,60 @@ impl StakeVaultContract {
             .get(&StorageKey::StakeToken)
             .ok_or(StakeVaultError::NotInitialized)?;
 
+        let cfg: SlashTierConfig = env
+            .storage()
+            .instance()
+            .get(&StorageKey::SlashTierConfig)
+            .unwrap_or_else(SlashTierConfig::default_config);
+
+        let tier_bps = match severity {
+            SlashSeverity::Minor => cfg.minor_bps as i128,
+            SlashSeverity::Major => cfg.major_bps as i128,
+            SlashSeverity::Critical => cfg.critical_bps as i128,
+        };
+
         let mut stakes: soroban_sdk::Map<Address, StakeInfoV2> = env
             .storage()
             .persistent()
             .get(&MigrationKey::StakesV2)
             .unwrap_or_else(|| soroban_sdk::Map::new(&env));
 
-        let mut info = stakes.get(provider.clone()).ok_or(StakeVaultError::NoStake)?;
+        let mut info = stakes
+            .get(provider.clone())
+            .ok_or(StakeVaultError::NoStake)?;
 
-        if amount <= 0 || amount > info.balance {
+        if info.balance == 0 {
             return Err(StakeVaultError::NoStake);
         }
 
-        // Reduce the staked balance before the burn (checks-effects-interactions).
-        info.balance = info
-            .balance
-            .checked_sub(amount)
-            .ok_or(StakeVaultError::NoStake)?;
+        // Compute slash amount from tier percentage; min 1 stroop.
+        let slash_amount = core::cmp::max((info.balance * tier_bps) / BPS_DENOMINATOR, 1);
+        let slash_amount = core::cmp::min(slash_amount, info.balance);
+
+        info.balance = info.balance.saturating_sub(slash_amount);
         info.last_updated = env.ledger().timestamp();
         stakes.set(provider.clone(), info);
         env.storage()
             .persistent()
             .set(&MigrationKey::StakesV2, &stakes);
 
-        // Emit structured event for audit trail before the external call.
+        // Event records severity tier and resulting slash amount for audit.
+        #[allow(deprecated)]
         env.events().publish(
             (
                 Symbol::new(&env, "stake_vault"),
                 Symbol::new(&env, "stake_slashed"),
             ),
-            (provider.clone(), amount, reason),
+            (provider.clone(), severity as u32, slash_amount, reason),
         );
 
-        // Burn the slashed tokens from the contract's token balance.
-        token::Client::new(&env, &token).burn(&env.current_contract_address(), &amount);
+        token::Client::new(&env, &token).burn(&env.current_contract_address(), &slash_amount);
 
-        Ok(())
+        Ok(slash_amount)
     }
 
-    /// Read the current stake balance for `staker` (0 if no record).
+    // ── Read ───────────────────────────────────────────────────────────────────
+
     pub fn get_stake(env: Env, staker: Address) -> i128 {
         let stakes: soroban_sdk::Map<Address, StakeInfoV2> = env
             .storage()

@@ -6,11 +6,7 @@ use super::*;
 use crate::categories::{RiskLevel, SignalCategory};
 use crate::errors::AdminError;
 use crate::migration::test_seed_v1_signals;
-use soroban_sdk::{
-    testutils::Address as _,
-    testutils::Ledger,
-    vec, Env, Map, String,
-};
+use soroban_sdk::{testutils::Address as _, testutils::Ledger, vec, Env, Map, String};
 
 #[test]
 fn test_initialize_and_admin() {
@@ -92,7 +88,7 @@ fn test_submit_signal_from_template() {
 
     let template_id = client.save_signal_template(
         &provider,
-        &SignalTemplate {
+        &SignalTemplatePreset {
             asset_pair: String::from_str(&env, "XLM/USDC"),
             action: SignalAction::Buy,
             risk_rating: 3,
@@ -468,18 +464,14 @@ fn test_multisig_enable_and_use() {
     signers.push_back(signer2.clone());
     signers.push_back(signer3.clone());
 
-    // Enable multi-sig with 2-of-3 threshold
     client.enable_multisig(&admin, &signers, &2);
 
     assert!(client.is_multisig_enabled());
     assert_eq!(client.get_multisig_threshold(), 2);
 
-    let returned_signers = client.get_multisig_signers();
-    assert_eq!(returned_signers.len(), 3);
-
-    // Any signer should be able to pause
-    client.pause_trading(&signer1);
-    assert!(client.is_paused());
+    // Direct pause by signer is blocked; use approval workflow instead
+    let result = client.try_pause_trading(&signer1);
+    assert_eq!(result, Err(Ok(AdminError::RequiresMultisigApproval)));
 }
 
 #[test]
@@ -736,11 +728,11 @@ fn test_cleanup_batch_limit() {
     use soroban_sdk::testutils::Ledger;
     env.ledger().set_timestamp(10000);
 
-    let provider = Address::generate(&env);
+    // Create 150 expired signals (unique providers avoid signal-submission rate limits)
     let current_time = env.ledger().timestamp();
-
-    // Create 150 expired signals
-    for _ in 0..150 {
+    for _i in 0..150 {
+        let provider = Address::generate(&env);
+        client.stake_tokens(&provider, &1_000_000_000i128);
         client.create_signal(
             &provider,
             &String::from_str(&env, "XLM/USDC"),

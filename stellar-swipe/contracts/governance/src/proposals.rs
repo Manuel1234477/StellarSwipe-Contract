@@ -2,8 +2,9 @@ use soroban_sdk::{contracttype, symbol_short, Address, Bytes, Env, Map, String, 
 use stellar_swipe_common::Asset;
 
 use crate::{
-    add_balance, checked_add, checked_mul, checked_sub, get_staked_balance, get_total_supply,
-    get_treasury, put_treasury, require_admin, GovernanceError, StorageKey,
+    add_balance, checked_add, checked_mul, checked_sub, get_holders, get_staked_balance,
+    get_total_supply, get_treasury, get_vote_snapshot, put_treasury, put_vote_snapshots,
+    require_admin, GovernanceError, StorageKey,
 };
 
 #[contracttype]
@@ -175,7 +176,9 @@ pub fn get_proposals_state(env: &Env) -> ProposalsState {
 }
 
 pub fn put_proposals_state(env: &Env, state: &ProposalsState) {
-    env.storage().instance().set(&StorageKey::ProposalsState, state);
+    env.storage()
+        .instance()
+        .set(&StorageKey::ProposalsState, state);
 }
 
 pub fn get_delegation_state(env: &Env) -> DelegationState {
@@ -186,7 +189,9 @@ pub fn get_delegation_state(env: &Env) -> DelegationState {
 }
 
 pub fn put_delegation_state(env: &Env, state: &DelegationState) {
-    env.storage().instance().set(&StorageKey::Delegations, state);
+    env.storage()
+        .instance()
+        .set(&StorageKey::Delegations, state);
 }
 
 pub fn create_proposal(
@@ -209,9 +214,25 @@ pub fn create_proposal(
     }
 
     validate_proposal(env, &proposal_type)?;
+    validate_execution_payload(&proposal_type, &execution_payload)?;
 
     let mut state = get_proposals_state(env);
     let id = state.next_proposal_id;
+
+    // Snapshot every current holder's effective voting power so that staking
+    // or unstaking after this point cannot affect votes on this proposal.
+    let holders = get_holders(env);
+    let mut snapshots: Map<Address, i128> = Map::new(env);
+    let mut hi = 0;
+    while hi < holders.len() {
+        let h = holders.get(hi).unwrap();
+        let p = get_effective_voting_power(env, &h);
+        if p > 0 {
+            snapshots.set(h, p);
+        }
+        hi += 1;
+    }
+    put_vote_snapshots(env, id, &snapshots);
     let now = env.ledger().timestamp();
 
     let proposal = Proposal {
@@ -288,7 +309,7 @@ pub fn cast_vote(
         return Err(GovernanceError::AlreadyVoted);
     }
 
-    let power = get_effective_voting_power(env, &voter);
+    let power = get_vote_snapshot(env, proposal_id, &voter).unwrap_or(0);
     if power <= 0 {
         return Err(GovernanceError::NoVotingPower);
     }
@@ -357,10 +378,16 @@ pub fn finalize_proposal(env: &Env, proposal_id: u64) -> Result<ProposalStatus, 
 
     if status == ProposalStatus::Succeeded {
         if let ProposalType::ContractUpgrade(ref contract, ref new_hash) = proposal.proposal_type {
-            let execution_available_after = proposal.voting_ends.saturating_add(cfg.execution_delay);
+            let execution_available_after =
+                proposal.voting_ends.saturating_add(cfg.execution_delay);
             env.events().publish(
                 (symbol_short!("upgrade"), symbol_short!("announced")),
-                (contract.clone(), new_hash.clone(), execution_available_after, proposal.execution_payload.clone()),
+                (
+                    contract.clone(),
+                    new_hash.clone(),
+                    execution_available_after,
+                    proposal.execution_payload.clone(),
+                ),
             );
         }
     }
@@ -418,7 +445,9 @@ pub fn execute_proposal_action(env: &Env, proposal: &Proposal) -> Result<(), Gov
             if bal < *amount {
                 return Err(GovernanceError::InsufficientBalance);
             }
-            treasury.assets.set(asset.clone(), checked_sub(bal, *amount)?);
+            treasury
+                .assets
+                .set(asset.clone(), checked_sub(bal, *amount)?);
             put_treasury(env, &treasury);
             add_balance(env, recipient, *amount)?;
         }
@@ -514,7 +543,9 @@ pub fn calculate_proposal_statistics(env: &Env) -> Result<ProposalStatistics, Go
         if let Some(p) = state.proposals.get(id) {
             total = total.saturating_add(1);
             match p.status {
-                ProposalStatus::Pending | ProposalStatus::Active => active = active.saturating_add(1),
+                ProposalStatus::Pending | ProposalStatus::Active => {
+                    active = active.saturating_add(1)
+                }
                 ProposalStatus::Succeeded => succeeded = succeeded.saturating_add(1),
                 ProposalStatus::Failed => failed = failed.saturating_add(1),
                 ProposalStatus::Executed => executed = executed.saturating_add(1),
@@ -526,15 +557,17 @@ pub fn calculate_proposal_statistics(env: &Env) -> Result<ProposalStatistics, Go
                 .saturating_add(p.votes_against)
                 .saturating_add(p.votes_abstain);
             if total_supply > 0 {
-                part_total = part_total
-                    .saturating_add((all_votes.saturating_mul(BPS_DENOMINATOR) / total_supply) as u64);
+                part_total = part_total.saturating_add(
+                    (all_votes.saturating_mul(BPS_DENOMINATOR) / total_supply) as u64,
+                );
                 part_count = part_count.saturating_add(1);
             }
 
             let cast_votes = p.votes_for.saturating_add(p.votes_against);
             if cast_votes > 0 {
-                appr_total = appr_total
-                    .saturating_add((p.votes_for.saturating_mul(BPS_DENOMINATOR) / cast_votes) as u64);
+                appr_total = appr_total.saturating_add(
+                    (p.votes_for.saturating_mul(BPS_DENOMINATOR) / cast_votes) as u64,
+                );
                 appr_count = appr_count.saturating_add(1);
             }
         }
@@ -678,6 +711,41 @@ fn validate_proposal(env: &Env, p: &ProposalType) -> Result<(), GovernanceError>
         }
         ProposalType::ContractUpgrade(_name, hash) => {
             if hash.len() != 32 {
+                return Err(GovernanceError::InvalidProposal);
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+/// Validate the execution payload bytes against what each ProposalType expects.
+///
+/// - `ContractUpgrade`: payload must be exactly 32 bytes (new WASM hash).
+/// - `TreasurySpend`/`ParameterChange`: non-empty payload must start with a
+///   known version byte (`0x01`) so malformed blobs are caught early.
+/// - `FeatureToggle`/`SignalProposal`: no payload constraints.
+/// - `Custom`: payload must be non-empty (executor address ABI).
+pub fn validate_execution_payload(
+    proposal_type: &ProposalType,
+    payload: &Bytes,
+) -> Result<(), GovernanceError> {
+    match proposal_type {
+        ProposalType::ContractUpgrade(_, _) => {
+            // Payload encodes the new WASM hash — must be exactly 32 bytes.
+            if payload.len() != 32 {
+                return Err(GovernanceError::InvalidProposal);
+            }
+        }
+        ProposalType::TreasurySpend(_, _, _, _) | ProposalType::ParameterChange(_, _, _) => {
+            // Optional but if present must carry a recognized version prefix.
+            if payload.len() > 0 && payload.get(0) != Some(0x01) {
+                return Err(GovernanceError::InvalidProposal);
+            }
+        }
+        ProposalType::Custom(_) => {
+            // Custom proposals must supply a non-empty payload (ABI data).
+            if payload.is_empty() {
                 return Err(GovernanceError::InvalidProposal);
             }
         }

@@ -1,8 +1,10 @@
 #![no_std]
 
+#[allow(deprecated)]
 mod admin;
 mod conversion;
 mod errors;
+#[allow(deprecated)]
 mod events;
 mod external_adapter;
 mod history;
@@ -18,8 +20,8 @@ use reputation::{
     adjust_oracle_weight, calculate_reputation, get_oracle_stats, should_remove_oracle,
     slash_oracle, track_oracle_accuracy, SlashReason,
 };
-use sdex::{calculate_spot_price, OrderBook, OrderEntry};
-use soroban_sdk::{contract, contractimpl, symbol_short, vec, Address, Env, Map, String, Vec};
+use sdex::{calculate_spot_price, OrderBook};
+use soroban_sdk::{contract, contractimpl, symbol_short, Address, Env, Map, String, Vec};
 use staleness::{OracleHealth, OracleStatus, StalenessLevel};
 use stellar_swipe_common::emergency::{PauseState, CAT_ALL};
 use stellar_swipe_common::{
@@ -414,6 +416,52 @@ impl OracleContract {
         get_oracle_stats(&env, &oracle)
     }
 
+    // ── Price normalization (Issue #decimal) ──────────────────────────────────
+
+    /// Admin: configure the native decimal precision for an asset pair.
+    ///
+    /// `decimals` is the number of fractional digits in the raw stored price
+    /// (e.g. 6 for a USDC-denominated feed where 1 USDC is stored as 1_000_000).
+    pub fn set_feed_decimals(
+        env: Env,
+        caller: Address,
+        pair: AssetPair,
+        decimals: u32,
+    ) -> Result<(), OracleError> {
+        Self::require_admin(&env, &caller)?;
+        caller.require_auth();
+        storage::set_feed_decimals(&env, &pair, decimals);
+        Ok(())
+    }
+
+    /// Read-only: return the configured native decimal precision for `pair`.
+    /// Returns `None` if no decimals have been configured.
+    pub fn get_feed_decimals(env: Env, pair: AssetPair) -> Option<u32> {
+        storage::get_feed_decimals(&env, &pair)
+    }
+
+    /// Read-only: return the current price for `pair` rescaled to `target_decimals`.
+    ///
+    /// Uses the same underlying price as `get_price` and rescales it so that
+    /// downstream consumers always work with a consistent decimal precision
+    /// regardless of how each asset's feed is originally stored.
+    ///
+    /// # Errors
+    /// - [`OracleError::PriceNotFound`] — no price set for `pair`, or no decimals
+    ///   configured (call `set_feed_decimals` first).
+    /// - [`OracleError::ConversionOverflow`] — rescaling would overflow `i128`.
+    pub fn get_normalized_price(
+        env: Env,
+        pair: AssetPair,
+        target_decimals: u32,
+    ) -> Result<i128, OracleError> {
+        let raw_price = storage::get_price(&env, &pair)?;
+        let from_decimals =
+            storage::get_feed_decimals(&env, &pair).ok_or(OracleError::PriceNotFound)?;
+        storage::rescale_price(raw_price, from_decimals, target_decimals)
+            .ok_or(OracleError::ConversionOverflow)
+    }
+
     fn read_oracles(env: &Env) -> Vec<Address> {
         env.storage()
             .persistent()
@@ -561,6 +609,16 @@ impl OracleContract {
             return Err(OracleError::StalePrice);
         }
 
+        // 1b. Enforce minimum independent source count
+        let min_count: u32 = env
+            .storage()
+            .instance()
+            .get(&StorageKey::MinSourceCount)
+            .unwrap_or(0);
+        if min_count > 0 && (fresh_prices.len() as u32) < min_count {
+            return Err(OracleError::InsufficientSources);
+        }
+
         // 2. Median Aggregation
         // Sort by price
         let mut sorted = fresh_prices;
@@ -586,6 +644,36 @@ impl OracleContract {
         }
 
         Ok((median_data.price, median_data.confidence))
+    }
+
+    /// Set the minimum number of independent fresh sources required before a
+    /// price is considered valid for risk-sensitive operations.
+    /// Admin only. Emits `min_src_count_updated`.
+    pub fn set_min_source_count(
+        env: Env,
+        admin: Address,
+        min_count: u32,
+    ) -> Result<(), OracleError> {
+        admin.require_auth();
+        Self::require_admin(&env, &admin)?;
+        let old: u32 = env
+            .storage()
+            .instance()
+            .get(&StorageKey::MinSourceCount)
+            .unwrap_or(0);
+        env.storage()
+            .instance()
+            .set(&StorageKey::MinSourceCount, &min_count);
+        events::emit_min_source_count_updated(&env, old, min_count);
+        Ok(())
+    }
+
+    /// Return the current minimum independent source count (0 = no requirement).
+    pub fn get_min_source_count(env: Env) -> u32 {
+        env.storage()
+            .instance()
+            .get(&StorageKey::MinSourceCount)
+            .unwrap_or(0)
     }
 
     pub fn add_price_source(
