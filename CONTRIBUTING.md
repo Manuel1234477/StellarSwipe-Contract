@@ -50,108 +50,30 @@ Both should pass with no manual fixes required.
 Extend `DataKey` and `{ContractName}Error` with your contract-specific variants
 before adding business logic.
 
-## Error code stability
+## Checked arithmetic for financial amounts
 
-Every `#[contracterror]` enum has a baseline JSON file in
-`stellar-swipe/error-baselines/<crate>.json`.  CI runs
-`scripts/check_error_codes.py` on every PR and fails (exit 1) if:
+Financial amounts (fees, P&L, balances, stakes — anything denominated in a
+Stellar 7-decimal `i128`) must not use raw `+`, `-`, `*`, `/` operators, since
+those panic on overflow in debug builds and wrap or panic unpredictably
+otherwise (Soroban release profile sets `overflow-checks = true`).
 
-- An existing variant's numeric discriminant changed (renumbering).
-- A numeric value that was previously assigned to one variant is now used for
-  a different variant (reuse).
+Use `stellar_swipe_common::Amount` instead:
 
-Adding a brand-new variant with a **previously-unused** number is allowed;
-the script updates the baseline automatically and exits 2 (informational).
+```rust
+use stellar_swipe_common::Amount;
 
-### Adding a new error code
+let total = Amount::new(a).checked_add(Amount::new(b))?; // Result<Amount, AmountError>
+let fee = principal.checked_mul_rate(fee_bps, 10_000)?;   // principal * fee_bps / 10_000
+```
 
-1. Add the variant to the enum with the next unused number.
-2. Run `python3 stellar-swipe/scripts/check_error_codes.py` locally — it
-   exits 2 and writes the updated baseline file.
-3. `git add stellar-swipe/error-baselines/<crate>.json` and include it in
-   your PR.
+`Amount` intentionally has no `Add`/`Sub`/`Mul`/`Div` impls, so attempting
+`amount_a + amount_b` is a compile error. Functions that perform financial
+arithmetic should additionally carry `#[warn(clippy::arithmetic_side_effects)]`
+on the function item — CI runs `cargo clippy --workspace --all-targets -- -D
+warnings`, so any raw arithmetic introduced inside that function fails the
+build (see `contracts/fee_collector/src/rebates.rs::record_trade_volume` and
+`contracts/user_portfolio/src/queries.rs::compute_get_pnl` for examples).
 
-### Deprecating an error code
-
-1. **Never reuse the number.**
-2. Add the variant to a `"deprecated"` list in the baseline JSON:
-   ```json
-   "deprecated": { "OldVariantName": 42 }
-   ```
-3. Remove (or keep) the Rust variant as a `// deprecated` constant — do not
-   reassign its discriminant.
-4. Open a PR with the `error-code-deprecation` label for reviewer awareness.
-
-### Why numbers must never change
-
-Clients (SDKs, indexers, monitoring tools) identify errors by their numeric
-code in the XDR envelope.  Renumbering or reusing a code silently breaks
-those clients even though the Rust code still compiles.
-
-## Dependency policy
-
-CI runs `cargo deny check` (via `stellar-swipe/deny.toml`) on every PR that
-touches a `Cargo.toml` or `Cargo.lock`.  The policy covers:
-
-| Area | Rule |
-|------|------|
-| Licenses | Only the allow-list in `deny.toml` is permitted.  Unlicensed or copyleft crates are denied. |
-| Banned crates | `openssl` and `ring ≤0.16` are banned.  See `[bans]` for the full list. |
-| Git sources | `unknown-git = "deny"`.  Git dependencies pinned to a mutable branch (no `rev =`) are not allowed; they break reproducible builds. |
-| Advisories | Crates with active RustSec advisories are denied unless individually listed in `[advisories] ignore` with a documented reason. |
-
-### Adding a new dependency
-
-1. Add the dependency to the relevant `Cargo.toml`.
-2. Run `cargo deny check` locally (`cargo install cargo-deny` if not installed).
-3. If the check passes, open a normal PR.
-4. If the check fails (e.g. the crate uses a license not on the allow-list):
-   - Replace the dependency with a compliant alternative, **or**
-   - Open a PR with the `dependency-review` label and explain why the policy
-     should be extended.  A maintainer must approve before the dependency can
-     be added.
-
-### Requesting a policy exception
-
-Open a PR with the `dependency-review` label.  The description must include:
-
-1. The crate name, version, and why it is needed.
-2. Why a compliant alternative does not exist.
-3. The specific `deny.toml` change required (e.g. adding a license or an
-   advisory to the ignore list).
-4. For advisories: the upstream issue/PR tracking the fix.
-
-Two maintainer approvals are required for any policy exception.
-
-## Clippy policy
-
-CI runs `cargo clippy --workspace --all-targets -- -D warnings`.  Any clippy
-warning fails the build.
-
-### Suppressing a lint
-
-- **Prefer fixing** the underlying issue over suppressing.
-- Suppressions must be **as narrow as possible**: annotate the individual item
-  (`fn`, `impl` block, expression) rather than the whole module or crate.
-- The `#[allow]` attribute must include a brief comment explaining why the
-  suppression is justified:
-
-  ```rust
-  // Soroban contract functions cannot use struct wrappers in the public ABI.
-  #[allow(clippy::too_many_arguments)]
-  pub fn my_contract_fn(env: Env, a: Address, …) { … }
-  ```
-
-- Workspace-wide suppressions live in `[workspace.lints.clippy]` in
-  `stellar-swipe/Cargo.toml` and require a PR that explains why the lint is
-  non-actionable across the whole workspace.
-
-### Requesting an exception
-
-Open a PR with the `lint-exception` label.  The PR description must include:
-
-1. The lint name and the code it fires on.
-2. Why fixing the code is not preferable.
-3. A `#[allow]` annotation scoped to the narrowest applicable span.
-
-Reviewers will merge only after confirming the suppression scope is minimal.
+This is scoped per-function rather than per-crate because the workspace sets
+`clippy::all = "allow"` broadly (issue #599) — a crate-wide deny would also
+flag unrelated, already-safe loop/index arithmetic across these large crates.
