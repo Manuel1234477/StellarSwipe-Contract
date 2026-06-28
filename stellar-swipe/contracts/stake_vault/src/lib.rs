@@ -156,6 +156,12 @@ pub enum StakeVaultError {
     StakeDurationNotElapsed = 12,
     /// No delegated stake found for the given delegator/provider pair.
     NoDelegatedStake = 13,
+    /// Stake-change rate limit (5 per day by default) has been exceeded.
+    RateLimitExceeded = 14,
+    /// Partial unstake would leave remaining stake below the protocol minimum.
+    RemainingStakeBelowMinimum = 15,
+    /// Requested amount is zero, negative, or >= the staker's full balance.
+    InvalidAmount = 16,
 }
 
 soroban_sdk::contractmeta!(
@@ -552,6 +558,17 @@ impl StakeVaultContract {
     pub fn withdraw_stake(env: Env, staker: Address) -> Result<i128, StakeVaultError> {
         Self::require_not_paused(&env)?;
 
+        if stellar_swipe_common::rate_limit::check_rate_limit(
+            &env,
+            &staker,
+            stellar_swipe_common::rate_limit::ActionType::StakeChange,
+            0,
+        )
+        .is_err()
+        {
+            return Err(StakeVaultError::RateLimitExceeded);
+        }
+
         // Read the stake balance first so we can scope the auth signature to
         // the exact amount being withdrawn, preventing signature reuse attacks.
         let stakes: soroban_sdk::Map<Address, StakeInfoV2> = env
@@ -678,6 +695,181 @@ impl StakeVaultContract {
         emit_provider_tier_change(env, staker, old_tier, new_tier, 0);
 
         // Cross-contract call: transfer tokens back to staker.
+        token::Client::new(env, &token).transfer(&env.current_contract_address(), staker, &amount);
+
+        Ok(amount)
+    }
+
+    // ── Partial unstake ────────────────────────────────────────────────────────
+
+    /// Withdraw `amount` of staked tokens from `staker`, leaving the remainder staked.
+    ///
+    /// Any unvested reward forfeiture is calculated proportionally to the withdrawn
+    /// fraction only — the remaining stake's lock and accrued rewards are untouched.
+    ///
+    /// Constraints:
+    /// - `amount` must be > 0 and strictly less than the full staked balance
+    ///   (use `withdraw_stake` for a full withdrawal).
+    /// - After withdrawal the remaining stake must be >= `minimum_stake` if one
+    ///   has been configured.
+    /// - Same flash-loan, large-withdrawal time-lock, and reentrancy protections
+    ///   as `withdraw_stake` apply.
+    pub fn partial_unstake(env: Env, staker: Address, amount: i128) -> Result<i128, StakeVaultError> {
+        Self::require_not_paused(&env)?;
+
+        if amount <= 0 {
+            return Err(StakeVaultError::InvalidAmount);
+        }
+
+        // Rate limit: counts as a StakeChange alongside full withdraw_stake calls.
+        if stellar_swipe_common::rate_limit::check_rate_limit(
+            &env,
+            &staker,
+            stellar_swipe_common::rate_limit::ActionType::StakeChange,
+            0,
+        )
+        .is_err()
+        {
+            return Err(StakeVaultError::RateLimitExceeded);
+        }
+
+        staker.require_auth();
+
+        // Reentrancy guard.
+        let lock_key = Symbol::new(&env, EXECUTION_LOCK);
+        if env
+            .storage()
+            .temporary()
+            .get::<_, bool>(&lock_key)
+            .unwrap_or(false)
+        {
+            return Err(StakeVaultError::ReentrancyDetected);
+        }
+        env.storage().temporary().set(&lock_key, &true);
+
+        let result = Self::do_partial_unstake(&env, &staker, amount);
+
+        env.storage().temporary().remove(&lock_key);
+
+        if result.is_ok() {
+            stellar_swipe_common::rate_limit::record_action(
+                &env,
+                &staker,
+                stellar_swipe_common::rate_limit::ActionType::StakeChange,
+            );
+        }
+
+        result
+    }
+
+    fn do_partial_unstake(env: &Env, staker: &Address, amount: i128) -> Result<i128, StakeVaultError> {
+        let token: Address = env
+            .storage()
+            .instance()
+            .get(&StorageKey::StakeToken)
+            .ok_or(StakeVaultError::NotInitialized)?;
+
+        let mut stakes: soroban_sdk::Map<Address, StakeInfoV2> = env
+            .storage()
+            .persistent()
+            .get(&MigrationKey::StakesV2)
+            .unwrap_or_else(|| soroban_sdk::Map::new(env));
+
+        let info = stakes.get(staker.clone()).ok_or(StakeVaultError::NoStake)?;
+
+        if info.balance == 0 {
+            return Err(StakeVaultError::NoStake);
+        }
+
+        // amount must be strictly less than the full balance — full withdrawal
+        // belongs in withdraw_stake.
+        if amount >= info.balance {
+            return Err(StakeVaultError::InvalidAmount);
+        }
+
+        let now = env.ledger().timestamp();
+        if now < info.locked_until {
+            return Err(StakeVaultError::StakeLocked);
+        }
+
+        // Flash loan detection: same-ledger stake + unstake.
+        let current_ledger = env.ledger().sequence();
+        let last_stake_ledger = env
+            .storage()
+            .temporary()
+            .get::<_, u32>(&StorageKey::LastStakeLedger(staker.clone()))
+            .unwrap_or(0);
+        if last_stake_ledger == current_ledger && current_ledger != 0 {
+            #[allow(deprecated)]
+            env.events().publish(
+                (
+                    Symbol::new(env, "stake_vault"),
+                    Symbol::new(env, "flash_loan_attempt"),
+                ),
+                (staker.clone(), info.balance, current_ledger),
+            );
+            return Err(StakeVaultError::FlashLoanDetected);
+        }
+
+        // Time-lock for large partial withdrawals (threshold applies to the withdrawn amount).
+        if amount >= LARGE_WITHDRAWAL_THRESHOLD {
+            let requested_at: u64 = env
+                .storage()
+                .persistent()
+                .get(&StorageKey::LargeWithdrawalRequestedAt(staker.clone()))
+                .ok_or(StakeVaultError::TimelockRequired)?;
+
+            if now < requested_at.saturating_add(LARGE_WITHDRAWAL_TIMELOCK_SECS) {
+                return Err(StakeVaultError::TimelockNotElapsed);
+            }
+
+            // Consume the request so it can't be reused.
+            env.storage()
+                .persistent()
+                .remove(&StorageKey::LargeWithdrawalRequestedAt(staker.clone()));
+        }
+
+        let remaining = info.balance - amount;
+
+        // Enforce minimum remaining stake.
+        let minimum_stake: i128 = env
+            .storage()
+            .instance()
+            .get(&StorageKey::MinimumStake)
+            .unwrap_or(0);
+        if minimum_stake > 0 && remaining < minimum_stake {
+            return Err(StakeVaultError::RemainingStakeBelowMinimum);
+        }
+
+        let old_tier = stake_tier_for_amount(info.balance);
+        let new_tier = stake_tier_for_amount(remaining);
+
+        // Reduce balance by the withdrawn amount; the remaining stake keeps its
+        // lock expiry — only the withdrawn fraction's unvested rewards are forfeited.
+        stakes.set(
+            staker.clone(),
+            StakeInfoV2 {
+                balance: remaining,
+                locked_until: info.locked_until,
+                last_updated: now,
+            },
+        );
+        env.storage()
+            .persistent()
+            .set(&MigrationKey::StakesV2, &stakes);
+
+        emit_provider_tier_change(env, staker, old_tier, new_tier, remaining);
+
+        #[allow(deprecated)]
+        env.events().publish(
+            (
+                Symbol::new(env, "stake_vault"),
+                Symbol::new(env, "partial_unstake"),
+            ),
+            (staker.clone(), amount, remaining),
+        );
+
+        // Transfer tokens back to staker (CEI: state updated before cross-contract call).
         token::Client::new(env, &token).transfer(&env.current_contract_address(), staker, &amount);
 
         Ok(amount)
