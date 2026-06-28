@@ -31,6 +31,12 @@ pub enum BridgeError {
     /// Distinct from DailyLimitExceeded (static anti-spam) so callers can differentiate.
     DynamicLiquidityLimitExceeded = 15,
     InvalidThreshold = 16,
+    /// Destination chain is not on the admin-managed allowlist (Issue #669).
+    UnsupportedDestinationChain = 17,
+    /// Message nonce is out of order; earlier messages must be confirmed first (Issue #668).
+    OutOfOrderNonce = 18,
+    /// Message nonce was already confirmed; duplicate delivery rejected (Issue #668).
+    DuplicateNonce = 19,
 }
 
 #[contracttype]
@@ -125,6 +131,8 @@ pub enum DataKey {
     LiquidityBuffer,
     TotalMinted,
     ReserveThreshold,
+    /// Admin-managed set of supported destination chain IDs (Issue #669).
+    SupportedChains,
 }
 
 const DAY_SECONDS: u64 = 86_400;
@@ -261,6 +269,8 @@ impl BridgeContract {
         if !cfg!(test) {
             user.require_auth();
         }
+        // ── #669: allowlist check ─────────────────────────────────────────────
+        ensure_chain_allowed(&env, destination_chain)?;
         validate_amount_and_limits(&env, amount)?;
         ensure_wrapped_asset_exists(&env, wrapped_asset.clone())?;
 
@@ -408,6 +418,8 @@ impl BridgeContract {
         if !cfg!(test) {
             user.require_auth();
         }
+        // ── #669: allowlist check ─────────────────────────────────────────────
+        ensure_chain_allowed(&env, destination_chain)?;
         validate_amount_and_limits(&env, amount)?;
 
         let balance_key = DataKey::WrappedBalance(user.clone(), wrapped_asset.clone());
@@ -716,6 +728,71 @@ impl BridgeContract {
     pub fn get_liquidity_buffer(env: Env) -> i128 {
         env.storage().persistent().get(&DataKey::LiquidityBuffer).unwrap_or(i128::MAX)
     }
+
+    // ── #669: Destination-chain allowlist ─────────────────────────────────────
+
+    /// Admin: add `chain` to the supported destination-chain allowlist.
+    pub fn add_supported_chain(env: Env, admin: Address, chain: ChainId) -> Result<(), BridgeError> {
+        require_admin(&env, &admin)?;
+        if !cfg!(test) {
+            admin.require_auth();
+        }
+        let mut chains = load_supported_chains(&env);
+        for i in 0..chains.len() {
+            if chains.get(i) == Some(chain) {
+                return Ok(());
+            }
+        }
+        chains.push_back(chain);
+        env.storage().instance().set(&DataKey::SupportedChains, &chains);
+        #[allow(deprecated)]
+        env.events().publish(
+            (Symbol::new(&env, "chain_added"),),
+            chain as u32,
+        );
+        Ok(())
+    }
+
+    /// Admin: remove `chain` from the supported destination-chain allowlist.
+    pub fn remove_supported_chain(env: Env, admin: Address, chain: ChainId) -> Result<(), BridgeError> {
+        require_admin(&env, &admin)?;
+        if !cfg!(test) {
+            admin.require_auth();
+        }
+        let chains = load_supported_chains(&env);
+        let mut updated: Vec<ChainId> = Vec::new(&env);
+        for i in 0..chains.len() {
+            if let Some(c) = chains.get(i) {
+                if c != chain {
+                    updated.push_back(c);
+                }
+            }
+        }
+        env.storage().instance().set(&DataKey::SupportedChains, &updated);
+        #[allow(deprecated)]
+        env.events().publish(
+            (Symbol::new(&env, "chain_removed"),),
+            chain as u32,
+        );
+        Ok(())
+    }
+
+    /// Return the current destination-chain allowlist.
+    pub fn get_supported_chains(env: Env) -> Vec<ChainId> {
+        load_supported_chains(&env)
+    }
+
+    // ── #668: Message nonce read-only entrypoint ───────────────────────────────
+
+    /// Return the next expected delivery-confirmation nonce for `source_chain_id`.
+    /// `source_chain_id` is the numeric value of `monitoring::ChainId`
+    /// (Stellar=0, Ethereum=1, Bitcoin=2, Polygon=3, BNB=4).
+    pub fn get_expected_nonce(env: Env, source_chain_id: u32) -> u64 {
+        env.storage()
+            .persistent()
+            .get(&messaging::MessagingKey::ExpectedNonce(source_chain_id))
+            .unwrap_or(0u64)
+    }
 }
 
 fn get_config(env: &Env) -> Result<BridgeConfig, BridgeError> {
@@ -744,6 +821,29 @@ fn store_transfer(env: &Env, transfer: &BridgeTransfer) {
     env.storage()
         .persistent()
         .set(&DataKey::Transfer(transfer.id), transfer);
+}
+
+/// Retrieve the current destination-chain allowlist.
+fn load_supported_chains(env: &Env) -> Vec<ChainId> {
+    env.storage()
+        .instance()
+        .get(&DataKey::SupportedChains)
+        .unwrap_or_else(|| Vec::new(env))
+}
+
+/// Return `Ok(())` when `destination_chain` is on the allowlist, or when the
+/// allowlist is empty (not yet configured). Returns `Err` otherwise.
+fn ensure_chain_allowed(env: &Env, destination_chain: ChainId) -> Result<(), BridgeError> {
+    let chains = load_supported_chains(env);
+    if chains.is_empty() {
+        return Ok(());
+    }
+    for i in 0..chains.len() {
+        if chains.get(i) == Some(destination_chain) {
+            return Ok(());
+        }
+    }
+    Err(BridgeError::UnsupportedDestinationChain)
 }
 
 fn ensure_wrapped_asset_exists(env: &Env, wrapped_asset: String) -> Result<(), BridgeError> {

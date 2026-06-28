@@ -4,6 +4,7 @@ use soroban_sdk::{contract, contractimpl, contracttype, Address, Env, String, Sy
 
 mod admin;
 mod advanced_risk;
+mod drawdown;
 mod loss_streak;
 #[cfg(feature = "testutils")]
 pub mod amm_bridge;
@@ -1548,6 +1549,48 @@ impl AutoTradeContract {
         user: Address,
     ) -> Option<portfolio_insurance::PortfolioInsurance> {
         portfolio_insurance::get_insurance(&env, &user)
+    }
+
+    // ── Drawdown trigger (Issue #674) ─────────────────────────────────────────
+
+    /// Configure a drawdown trigger for the user.
+    /// `threshold_bps` is the drop from peak (in basis points, e.g. 1000 = 10%).
+    /// When breached, `action` is returned by `update_portfolio_value`.
+    pub fn configure_drawdown_trigger(
+        env: Env,
+        user: Address,
+        threshold_bps: u32,
+        action: drawdown::DrawdownAction,
+    ) -> Result<drawdown::DrawdownTrigger, AutoTradeError> {
+        if !cfg!(test) {
+            user.require_auth();
+        }
+        drawdown::configure_drawdown_trigger(&env, &user, threshold_bps, action)
+    }
+
+    /// Update the per-user high-water mark with the latest `current_value` and
+    /// check whether the drawdown threshold is breached.
+    ///
+    /// Returns `Some(action)` when the trigger fires.
+    pub fn update_portfolio_value(
+        env: Env,
+        user: Address,
+        current_value: i128,
+    ) -> Result<Option<drawdown::DrawdownAction>, AutoTradeError> {
+        if !cfg!(test) {
+            user.require_auth();
+        }
+        drawdown::update_and_check(&env, &user, current_value)
+    }
+
+    /// Read-only: check if the drawdown trigger fires for `user` at `current_value`.
+    pub fn check_drawdown_trigger(env: Env, user: Address, current_value: i128) -> bool {
+        drawdown::check_drawdown_trigger(&env, &user, current_value)
+    }
+
+    /// Return the stored high-water mark for `user`.
+    pub fn get_high_water_mark(env: Env, user: Address) -> Option<drawdown::HighWaterMark> {
+        drawdown::get_high_water_mark(&env, &user)
     }
 
     // ── Exit Strategy ────────────────────────────────────────────────────────
