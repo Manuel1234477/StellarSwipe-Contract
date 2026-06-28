@@ -20,7 +20,8 @@ use risk_gates::{
 };
 use sdex::{execute_sdex_swap, min_received_from_slippage};
 use soroban_sdk::{
-    contract, contractimpl, contracttype, Address, Bytes, Env, IntoVal, String, Symbol, Val, Vec,
+    contract, contractimpl, contracttype, Address, Bytes, BytesN, Env, IntoVal, String, Symbol,
+    Val, Vec,
 };
 
 use stellar_swipe_common::replay_protection::verify_and_commit;
@@ -70,6 +71,90 @@ pub enum StorageKey {
     FeatureFlag(String),
     /// Per-asset minimum trade size override (absent = use [`DEFAULT_MIN_TRADE_SIZE`]).
     MinTradeSize(Address),
+    /// Monotonic counter for trade receipt IDs.
+    NextTradeReceiptId,
+    /// Stored hash for a given trade receipt ID (`trade_receipt_id → BytesN<32>`).
+    TradeReceiptHash(u64),
+}
+
+/// On-chain trade receipt emitted alongside every successful trade execution.
+///
+/// The `hash` field is `SHA-256(user_strkey || asset_strkey || amount_be16 || price_be16 || timestamp_be8)`.
+/// It can be recomputed off-chain from the receipt fields to verify authenticity.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TradeReceiptEvent {
+    pub trade_receipt_id: u64,
+    pub hash: BytesN<32>,
+    pub user: Address,
+    pub asset: Address,
+    pub amount: i128,
+    pub price: i128,
+    pub timestamp: u64,
+}
+
+/// Compute `SHA-256(user_strkey || asset_strkey || amount_be16 || price_be16 || timestamp_be8)`.
+#[doc(hidden)]
+///
+/// Using Stellar's canonical strkey encoding for addresses ensures the preimage is
+/// deterministic and independently recomputable without on-chain access.
+pub fn compute_trade_hash(
+    env: &Env,
+    user: &Address,
+    asset: &Address,
+    amount: i128,
+    price: i128,
+    timestamp: u64,
+) -> BytesN<32> {
+    let mut preimage = Bytes::new(env);
+    preimage.append(&user.to_string().to_bytes());
+    preimage.append(&asset.to_string().to_bytes());
+    preimage.append(&Bytes::from_array(env, &amount.to_be_bytes()));
+    preimage.append(&Bytes::from_array(env, &price.to_be_bytes()));
+    preimage.append(&Bytes::from_array(env, &timestamp.to_be_bytes()));
+    env.crypto().sha256(&preimage)
+}
+
+fn next_trade_receipt_id(env: &Env) -> u64 {
+    let id: u64 = env
+        .storage()
+        .instance()
+        .get(&StorageKey::NextTradeReceiptId)
+        .unwrap_or(1u64);
+    let next = id.checked_add(1).expect("receipt id overflow");
+    env.storage()
+        .instance()
+        .set(&StorageKey::NextTradeReceiptId, &next);
+    id
+}
+
+fn record_trade_receipt(env: &Env, user: &Address, token: &Address, amount: i128) {
+    let timestamp = env.ledger().timestamp();
+    let price: i128 = env
+        .storage()
+        .instance()
+        .get(&StorageKey::SdexPrice(token.clone()))
+        .unwrap_or(0i128);
+    let hash = compute_trade_hash(env, user, token, amount, price, timestamp);
+    let receipt_id = next_trade_receipt_id(env);
+    env.storage()
+        .instance()
+        .set(&StorageKey::TradeReceiptHash(receipt_id), &hash);
+    env.events().publish(
+        (
+            Symbol::new(env, "trade_executor"),
+            Symbol::new(env, "trade_receipt"),
+        ),
+        TradeReceiptEvent {
+            trade_receipt_id: receipt_id,
+            hash,
+            user: user.clone(),
+            asset: token.clone(),
+            amount,
+            price,
+            timestamp,
+        },
+    );
 }
 
 /// Temporary-storage key for the reentrancy lock on `execute_copy_trade`.
@@ -466,6 +551,8 @@ fn execute_market_copy_trade(
             },
         );
     }
+
+    record_trade_receipt(env, &user, &token, effective_amount);
 
     env.storage().temporary().remove(&lock_key);
     Ok(())
@@ -1228,6 +1315,18 @@ impl TradeExecutorContract {
         }
 
         Ok(results)
+    }
+
+    // ── Trade receipt (Issue #683) ────────────────────────────────────────────
+
+    /// Returns the stored SHA-256 receipt hash for `trade_receipt_id`, or `None` if not found.
+    ///
+    /// The hash covers `(user, asset, amount, price, timestamp)` and can be recomputed
+    /// off-chain from the `trade_receipt` event data to verify the trade's authenticity.
+    pub fn get_trade_receipt(env: Env, trade_receipt_id: u64) -> Option<BytesN<32>> {
+        env.storage()
+            .instance()
+            .get(&StorageKey::TradeReceiptHash(trade_receipt_id))
     }
 
     // ── DCA copy trading (Issue #360) ─────────────────────────────────────────
