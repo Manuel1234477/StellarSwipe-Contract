@@ -1,5 +1,9 @@
 #![no_std]
 
+/// Shared timestamp-based expiry trait (issue #679).
+pub mod expiry;
+pub use expiry::Expirable;
+
 pub mod access_control;
 
 pub mod auth;

@@ -48,6 +48,8 @@ mod storage;
 pub mod storage;
 mod strategies;
 mod twap;
+/// Fee-aware execution priority queue (issue #675).
+pub mod priority_queue;
 
 pub use errors::AutoTradeError;
 pub use risk::RiskConfig;
@@ -2010,6 +2012,13 @@ impl AutoTradeContract {
     /// pause via `unpause_category`.
     pub fn trigger_inactivity_pause(env: Env, caller: Address) -> Result<(), AutoTradeError> {
         admin::trigger_inactivity_pause(&env, &caller)
+    }
+
+    /// Read-only snapshot of all pending auto-trade actions ordered by
+    /// execution priority (StopLoss > TakeProfit > Rebalance), then FIFO
+    /// within the same priority level.
+    pub fn get_queue_snapshot(env: Env) -> soroban_sdk::Vec<priority_queue::QueuedAction> {
+        priority_queue::get_queue_snapshot(&env)
     }
 }
 

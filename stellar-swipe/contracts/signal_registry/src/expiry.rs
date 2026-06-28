@@ -4,6 +4,8 @@ use stellar_swipe_common::{SECONDS_PER_30_DAY_MONTH, SECONDS_PER_DAY};
 use crate::events::emit_signal_expired;
 use crate::types::{Signal, SignalStatus};
 
+use shared::Expirable;
+
 pub const DEFAULT_EXPIRY_SECONDS: u64 = SECONDS_PER_DAY; // 24 hours
 pub const MAX_CLEANUP_BATCH_SIZE: u32 = 100; // Process max 100 signals per cleanup call
 pub const ARCHIVE_THRESHOLD_SECONDS: u64 = SECONDS_PER_30_DAY_MONTH; // 30 days
@@ -14,10 +16,19 @@ pub struct CleanupResult {
     pub signals_expired: u32,
 }
 
-/// Check if a signal has expired based on current time
+impl Expirable for Signal {
+    fn expiry_timestamp(&self) -> u64 {
+        self.expiry
+    }
+}
+
+/// Check if a signal has expired based on current ledger time.
+///
+/// Delegates to the shared [`Expirable`] trait implementation on [`Signal`].
+/// Boundary: `current_time > signal.expiry` (exclusive — at the exact
+/// expiry second the signal is still considered live).
 pub fn is_expired(env: &Env, signal: &Signal) -> bool {
-    let current_time = env.ledger().timestamp();
-    current_time > signal.expiry
+    signal.is_expired(env.ledger().timestamp())
 }
 
 /// Check if signal should be archived (expired for more than 30 days)
