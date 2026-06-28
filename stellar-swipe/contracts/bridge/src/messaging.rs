@@ -41,6 +41,8 @@ pub struct CrossChainMessage {
     pub status: MessageStatus,
     pub sent_at: u64,
     pub delivered_at: Option<u64>,
+    /// Monotonically increasing sequence number per target chain (Issue #668).
+    pub nonce: u64,
 }
 
 // ── Storage keys ─────────────────────────────────────────────────────────────
@@ -50,9 +52,35 @@ pub enum MessagingKey {
     Message(u64),
     NextMessageId,
     BridgeForChain(u32),
+    /// Monotonically assigned outbound sequence counter per target chain (Issue #668).
+    OutboundSeq(u32),
+    /// Next expected delivery-confirmation nonce per target chain (Issue #668).
+    ExpectedNonce(u32),
 }
 
 // ── Storage helpers ───────────────────────────────────────────────────────────
+
+/// Return the next expected delivery-confirmation nonce for `chain` (Issue #668).
+/// Messages to `chain` must be confirmed in this sequence order.
+pub fn get_expected_nonce(env: &Env, chain: ChainId) -> u64 {
+    env.storage()
+        .persistent()
+        .get(&MessagingKey::ExpectedNonce(chain as u32))
+        .unwrap_or(0u64)
+}
+
+/// Assign the next outbound sequence number for messages sent to `chain`.
+fn assign_outbound_nonce(env: &Env, chain: ChainId) -> u64 {
+    let seq: u64 = env
+        .storage()
+        .persistent()
+        .get(&MessagingKey::OutboundSeq(chain as u32))
+        .unwrap_or(0u64);
+    env.storage()
+        .persistent()
+        .set(&MessagingKey::OutboundSeq(chain as u32), &(seq + 1));
+    seq
+}
 
 fn get_message(env: &Env, id: u64) -> Result<CrossChainMessage, String> {
     env.storage()
@@ -148,6 +176,7 @@ pub fn send_cross_chain_message(
     }
 
     let id = next_message_id(env);
+    let nonce = assign_outbound_nonce(env, target_chain);
 
     let msg = CrossChainMessage {
         id,
@@ -161,6 +190,7 @@ pub fn send_cross_chain_message(
         status: MessageStatus::Pending,
         sent_at: env.ledger().timestamp(),
         delivered_at: None,
+        nonce,
     };
 
     save_message(env, &msg);
@@ -224,6 +254,21 @@ pub fn confirm_message_delivery(
     if msg.status != MessageStatus::Relayed {
         return Err(String::from_str(env, "Message not relayed"));
     }
+
+    // ── #668: enforce in-order delivery ──────────────────────────────────────
+    // Deliveries for a given target chain must be confirmed in the same order
+    // messages were sent (nonce 0, 1, 2, …).
+    let expected = get_expected_nonce(env, msg.target_chain);
+    if msg.nonce != expected {
+        if msg.nonce < expected {
+            return Err(String::from_str(env, "Duplicate nonce: already delivered"));
+        }
+        return Err(String::from_str(env, "Out-of-order nonce: expected lower sequence"));
+    }
+    // Advance the expected delivery nonce for this target chain.
+    env.storage()
+        .persistent()
+        .set(&MessagingKey::ExpectedNonce(msg.target_chain as u32), &(expected + 1));
 
     verify_delivery_proof(env, msg.target_chain, message_id, &delivery_proof)?;
 
