@@ -1,5 +1,5 @@
 use soroban_sdk::{contracttype, symbol_short, Address, Bytes, Env, Map, String, Vec};
-use stellar_swipe_common::Asset;
+use stellar_swipe_common::{sanitize_string, Asset};
 
 use crate::{
     add_balance, checked_add, checked_mul, checked_sub, get_holders, get_staked_balance,
@@ -262,6 +262,8 @@ pub fn create_proposal(
     if title.is_empty() || description.is_empty() {
         return Err(GovernanceError::InvalidProposal);
     }
+    sanitize_string(env, &title, 256).map_err(|_| GovernanceError::InvalidProposal)?;
+    sanitize_string(env, &description, 4096).map_err(|_| GovernanceError::InvalidProposal)?;
 
     let config = get_governance_config(env);
     let power = get_effective_voting_power(env, &proposer);

@@ -1,5 +1,11 @@
 #![no_std]
 
+/// Shared event-emission macro (issue #677).
+pub mod emit;
+/// Shared input-sanitization helper for string-based metadata fields (issue #676).
+pub mod sanitize;
+pub use sanitize::{sanitize_string, SanitizeError};
+
 #[allow(deprecated)]
 pub mod amm_bridge;
 pub mod retry_backoff;

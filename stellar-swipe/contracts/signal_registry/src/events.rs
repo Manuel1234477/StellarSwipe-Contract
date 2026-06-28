@@ -17,13 +17,11 @@ pub fn emit_admin_transfer_proposed(
 }
 
 pub fn emit_admin_transfer_completed(env: &Env, old_admin: Address, new_admin: Address) {
-    let topics = (Symbol::new(env, "admin_transfer_completed"),);
-    env.events().publish(topics, (old_admin, new_admin));
+    stellar_swipe_common::emit_event!(env, "admin_transfer_completed", (old_admin, new_admin));
 }
 
 pub fn emit_admin_transferred(env: &Env, old_admin: Address, new_admin: Address) {
-    let topics = (Symbol::new(env, "admin_transferred"),);
-    env.events().publish(topics, (old_admin, new_admin));
+    stellar_swipe_common::emit_event!(env, "admin_transferred", (old_admin, new_admin));
 }
 
 pub fn emit_parameter_updated(env: &Env, parameter: Symbol, old_value: i128, new_value: i128) {
