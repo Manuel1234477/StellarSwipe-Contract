@@ -7,6 +7,7 @@ static ALLOC: dlmalloc::GlobalDlmalloc = dlmalloc::GlobalDlmalloc;
 mod admin;
 mod analytics;
 mod categories;
+mod churn_risk;
 mod collaboration;
 mod combos;
 mod community_voting;
@@ -1107,6 +1108,52 @@ impl SignalRegistry {
         Ok(())
     }
 
+    /// Edit signal with an append-only audit trail (Issue #686).
+    /// Stores a snapshot of the current signal state before applying changes,
+    /// creating a versioned history that can be retrieved via get_signal_version_history.
+    /// Only the original provider may edit, and only before any follower has
+    /// copy-traded the signal.
+    pub fn edit_signal_audit(
+        env: Env,
+        provider: Address,
+        signal_id: u64,
+        new_price: Option<i128>,
+        new_rationale: Option<soroban_sdk::String>,
+        new_expiry: Option<u64>,
+    ) -> Result<u32, SignalEditError> {
+        provider.require_auth();
+        admin::require_not_paused(&env, String::from_str(&env, CAT_SIGNALS))
+            .map_err(|_| SignalEditError::TradingPaused)?;
+
+        let mut signals = Self::get_signals_map(&env);
+        let mut signal = signals
+            .get(signal_id)
+            .ok_or(SignalEditError::SignalNotFound)?;
+
+        let new_version = versioning::edit_signal_with_audit(
+            &env,
+            signal_id,
+            &provider,
+            new_price,
+            new_rationale,
+            new_expiry,
+            &mut signal,
+        )?;
+
+        signals.set(signal_id, signal.clone());
+        Self::save_signals_map(&env, &signals);
+        Ok(new_version)
+    }
+
+    /// Retrieve the full version history for a signal (audit trail, Issue #686).
+    /// Returns all stored versions in chronological order.
+    pub fn get_signal_version_history(
+        env: Env,
+        signal_id: u64,
+    ) -> Vec<versioning::SignalVersion> {
+        versioning::get_signal_history(&env, signal_id)
+    }
+
     /// Record closed-signal outcome and update provider reputation (Issue #170).
     pub fn record_signal_outcome(
         env: Env,
@@ -1961,6 +2008,45 @@ impl SignalRegistry {
     ) -> analytics::CategoryAnalytics {
         let signals = Self::get_signals_map(&env);
         analytics::calculate_category_analytics(&env, &signals, &category)
+    }
+
+    // ── Churn-risk scoring (Issue #churn) ────────────────────────────────────
+
+    /// Read-only: compute the churn-risk score for a provider.
+    ///
+    /// Combines trailing signal-frequency decline (40 %), follower-unsubscribe
+    /// rate (30 %), and performance trend (30 %) into a composite 0–100 score.
+    /// Emits `churn_risk_elevated` when the composite score meets or exceeds the
+    /// admin-configured threshold.
+    pub fn get_provider_churn_risk(
+        env: Env,
+        provider: Address,
+    ) -> churn_risk::ChurnRiskScore {
+        let signals = Self::get_signals_map(&env);
+        let stats_map = Self::get_provider_stats_map(&env);
+        let stats = stats_map.get(provider.clone());
+        churn_risk::get_provider_churn_risk(&env, &provider, &signals, stats.as_ref())
+    }
+
+    /// Admin: set the composite-score threshold above which `churn_risk_elevated`
+    /// is emitted. Valid range 0–100. Default is 67 (high-risk boundary).
+    pub fn set_churn_risk_threshold(
+        env: Env,
+        caller: Address,
+        threshold: u32,
+    ) -> Result<(), AdminError> {
+        admin::require_admin(&env, &caller)?;
+        caller.require_auth();
+        if threshold > 100 {
+            return Err(AdminError::InvalidParameter);
+        }
+        churn_risk::set_churn_threshold(&env, threshold);
+        Ok(())
+    }
+
+    /// Admin: get the current churn-risk threshold.
+    pub fn get_churn_risk_threshold(env: Env) -> u32 {
+        churn_risk::get_churn_threshold(&env)
     }
 
     /* =========================
