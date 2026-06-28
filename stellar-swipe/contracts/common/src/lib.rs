@@ -3,6 +3,8 @@
 #[allow(deprecated)]
 pub mod amm_bridge;
 pub mod assets;
+/// Checked-arithmetic wrapper for financial amounts (issue #599).
+pub mod checked_amount;
 pub mod commit_reveal;
 pub mod constants;
 pub mod emergency;
