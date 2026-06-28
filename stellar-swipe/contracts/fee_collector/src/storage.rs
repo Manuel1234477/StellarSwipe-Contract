@@ -107,6 +107,14 @@ pub enum StorageKey {
     WaterfallConfig,
     /// #691: Per-provider preferred payout token.
     ProviderPayoutCurrency(Address),
+    /// #664: Admin-configured volume-based discount tiers.
+    VolumeDiscountConfig,
+    /// #665: Fee forecast configuration.
+    ForecastConfig,
+    /// #665: Per-token daily fee total (token, day).
+    DailyFeeTotal(Address, u64),
+    /// #665: Last day a forecast was emitted per token.
+    LastForecastDay(Address),
 }
 
 #[contracttype]
@@ -543,4 +551,96 @@ pub fn remove_provider_payout_currency(env: &Env, provider: &Address) {
     env.storage()
         .persistent()
         .remove(&StorageKey::ProviderPayoutCurrency(provider.clone()));
+}
+
+// ── #664: Volume Discount Tiers ──────────────────────────────────────────────
+
+/// A single volume-based discount tier.
+/// Users who meet or exceed `volume_threshold_usd` receive a `discount_bps`
+/// reduction on the base fee rate.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct VolumeTier {
+    pub volume_threshold_usd: i128,
+    pub discount_bps: u32,
+}
+
+/// Admin-configurable set of volume discount tiers.
+/// Must contain at least 3 tiers, sorted ascending by `volume_threshold_usd`.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct VolumeDiscountConfig {
+    pub tiers: Vec<VolumeTier>,
+}
+
+pub fn get_volume_discount_config(env: &Env) -> Option<VolumeDiscountConfig> {
+    env.storage()
+        .instance()
+        .get(&StorageKey::VolumeDiscountConfig)
+}
+
+pub fn set_volume_discount_config_storage(env: &Env, config: &VolumeDiscountConfig) {
+    env.storage()
+        .instance()
+        .set(&StorageKey::VolumeDiscountConfig, config);
+}
+
+// ── #665: Fee Forecast ───────────────────────────────────────────────────────
+
+/// Admin-configurable forecast parameters.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct ForecastConfigData {
+    /// How often a forecast event is auto-emitted (in days).
+    pub epoch_cadence_days: u64,
+    /// Number of historical days used to compute the trailing average.
+    pub window_days: u64,
+}
+
+pub const DEFAULT_EPOCH_CADENCE_DAYS: u64 = 1;
+pub const DEFAULT_FORECAST_WINDOW_DAYS: u64 = 7;
+pub const SECONDS_PER_DAY_FC: u64 = 86_400;
+
+pub fn get_forecast_config(env: &Env) -> ForecastConfigData {
+    env.storage()
+        .instance()
+        .get(&StorageKey::ForecastConfig)
+        .unwrap_or(ForecastConfigData {
+            epoch_cadence_days: DEFAULT_EPOCH_CADENCE_DAYS,
+            window_days: DEFAULT_FORECAST_WINDOW_DAYS,
+        })
+}
+
+pub fn set_forecast_config_storage(env: &Env, config: &ForecastConfigData) {
+    env.storage()
+        .instance()
+        .set(&StorageKey::ForecastConfig, config);
+}
+
+pub fn get_daily_fee_total(env: &Env, token: &Address, day: u64) -> i128 {
+    env.storage()
+        .persistent()
+        .get(&StorageKey::DailyFeeTotal(token.clone(), day))
+        .unwrap_or(0)
+}
+
+pub fn add_daily_fee_total(env: &Env, token: &Address, day: u64, amount: i128) {
+    let current = get_daily_fee_total(env, token, day);
+    env.storage().persistent().set(
+        &StorageKey::DailyFeeTotal(token.clone(), day),
+        &current.saturating_add(amount),
+    );
+}
+
+pub fn get_last_forecast_day(env: &Env, token: &Address) -> u64 {
+    env.storage()
+        .persistent()
+        .get(&StorageKey::LastForecastDay(token.clone()))
+        .unwrap_or(0)
+}
+
+pub fn set_last_forecast_day(env: &Env, token: &Address, day: u64) {
+    env.storage()
+        .persistent()
+        .set(&StorageKey::LastForecastDay(token.clone()), &day);
 }

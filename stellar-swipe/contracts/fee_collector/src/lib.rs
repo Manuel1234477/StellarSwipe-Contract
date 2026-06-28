@@ -6,12 +6,12 @@ pub use errors::ContractError;
 mod events;
 mod fee_cache;
 use events::{
-    emit_error_reported, emit_fee_collected, emit_fee_rate_updated, emit_fees_claimed,
-    emit_fees_claimed_converted, emit_first_trade_fee_waived, emit_network_condition_updated,
-    emit_payout_currency_set, emit_retry_attempted, emit_treasury_withdrawal,
-    emit_waterfall_distribution, emit_withdrawal_queued, EvtErrorReported, EvtFeeCollected,
-    EvtFeeRateUpdated, EvtFeesClaimed, EvtNetworkConditionUpdated, EvtRetryAttempted,
-    EvtTreasuryWithdrawal, EvtWithdrawalQueued,
+    emit_error_reported, emit_fee_collected, emit_fee_forecast, emit_fee_rate_updated,
+    emit_fees_claimed, emit_fees_claimed_converted, emit_first_trade_fee_waived,
+    emit_network_condition_updated, emit_payout_currency_set, emit_retry_attempted,
+    emit_treasury_withdrawal, emit_volume_discount_config_updated, emit_waterfall_distribution,
+    emit_withdrawal_queued, EvtErrorReported, EvtFeeCollected, EvtFeeRateUpdated, EvtFeesClaimed,
+    EvtNetworkConditionUpdated, EvtRetryAttempted, EvtTreasuryWithdrawal, EvtWithdrawalQueued,
 };
 pub use events::{
     FeeRateUpdated, FeesBurned, FeesClaimed, FirstTradeFeeWaived, TreasuryWithdrawal,
@@ -26,20 +26,24 @@ pub use reports::{EarningsLeaderboardEntry, EarningsReport, ReportPeriod};
 mod storage;
 pub use storage::BalanceMismatch;
 use storage::{
-    get_admin, get_burn_rate, get_failed_fee_collection, get_fee_optimization_config, get_fee_rate,
-    get_last_error_report, get_monthly_trade_volume, get_network_condition_score,
+    add_daily_fee_total, get_admin, get_burn_rate, get_daily_fee_total, get_failed_fee_collection,
+    get_fee_optimization_config, get_fee_rate, get_forecast_config, get_last_error_report,
+    get_last_forecast_day, get_monthly_trade_volume, get_network_condition_score,
     get_oracle_contract, get_pending_fees, get_provider_payout_currency, get_queued_withdrawal,
-    get_treasury_balance, get_waterfall_config, has_traded, is_initialized,
-    remove_failed_fee_collection, remove_monthly_trade_volume, remove_provider_payout_currency,
-    remove_queued_withdrawal, set_admin, set_burn_rate as set_burn_rate_storage,
-    set_failed_fee_collection, set_fee_optimization_config, set_fee_rate as set_fee_rate_storage,
-    set_has_traded, set_initialized, set_last_error_report, set_monthly_trade_volume,
-    set_network_condition_score, set_oracle_contract as set_oracle_contract_storage,
-    set_pending_fees, set_provider_payout_currency,
-    set_queued_withdrawal, set_treasury_balance,
+    get_treasury_balance, get_volume_discount_config, get_waterfall_config, has_traded,
+    is_initialized, remove_failed_fee_collection, remove_monthly_trade_volume,
+    remove_provider_payout_currency, remove_queued_withdrawal, set_admin,
+    set_burn_rate as set_burn_rate_storage, set_failed_fee_collection,
+    set_fee_optimization_config, set_fee_rate as set_fee_rate_storage,
+    set_forecast_config_storage, set_has_traded, set_initialized, set_last_error_report,
+    set_last_forecast_day, set_monthly_trade_volume, set_network_condition_score,
+    set_oracle_contract as set_oracle_contract_storage, set_pending_fees,
+    set_provider_payout_currency, set_queued_withdrawal, set_treasury_balance,
+    set_volume_discount_config_storage,
     set_waterfall_config as set_waterfall_config_storage, ErrorReport, FailedFeeCollection,
-    FeeOptimizationConfig, MonthlyTradeVolume, QueuedWithdrawal, StorageKey, WaterfallConfig,
-    WaterfallTier, WaterfallTierResult, MAX_BURN_RATE_BPS, MAX_FEE_RATE_BPS, MIN_FEE_RATE_BPS,
+    FeeOptimizationConfig, ForecastConfigData, MonthlyTradeVolume, QueuedWithdrawal, StorageKey,
+    VolumeDiscountConfig, VolumeTier, WaterfallConfig, WaterfallTier, WaterfallTierResult,
+    MAX_BURN_RATE_BPS, MAX_FEE_RATE_BPS, MIN_FEE_RATE_BPS, SECONDS_PER_DAY_FC,
 };
 
 use soroban_sdk::{contract, contractimpl, contracttype, token, Address, Env, IntoVal, String,
@@ -725,6 +729,16 @@ impl FeeCollector {
 
         rebates::record_trade_volume(&env, &trader, &trade_asset, trade_amount)?;
 
+        // #665: Record daily fee total and auto-emit forecast on epoch boundary.
+        let current_day = env.ledger().timestamp() / SECONDS_PER_DAY_FC;
+        add_daily_fee_total(&env, &token, current_day, fee_amount);
+        let forecast_cfg = get_forecast_config(&env);
+        let last_forecast_day = get_last_forecast_day(&env, &token);
+        if current_day >= last_forecast_day.saturating_add(forecast_cfg.epoch_cadence_days) {
+            Self::compute_and_emit_forecast(&env, &token, current_day, &forecast_cfg);
+            set_last_forecast_day(&env, &token, current_day);
+        }
+
         emit_fee_collected(
             &env,
             EvtFeeCollected {
@@ -737,6 +751,38 @@ impl FeeCollector {
         );
 
         Ok(fee_amount)
+    }
+
+    fn compute_and_emit_forecast(
+        env: &Env,
+        token: &Address,
+        current_day: u64,
+        cfg: &ForecastConfigData,
+    ) {
+        let window = cfg.window_days;
+        if window == 0 {
+            return;
+        }
+        let mut total: i128 = 0;
+        let mut days_with_data: u64 = 0;
+        let mut i: u64 = 0;
+        while i < window {
+            let day = current_day.saturating_sub(i);
+            let daily_total = get_daily_fee_total(env, token, day);
+            if daily_total > 0 {
+                total = total.saturating_add(daily_total);
+                days_with_data = days_with_data.saturating_add(1);
+            }
+            i = i.saturating_add(1);
+        }
+        if days_with_data == 0 {
+            return;
+        }
+        let projected = total
+            .checked_div(days_with_data as i128)
+            .and_then(|avg| avg.checked_mul(cfg.epoch_cadence_days as i128))
+            .unwrap_or(0);
+        emit_fee_forecast(env, token, projected, window, current_day);
     }
 
     fn effective_fee_rate_for_trade(
@@ -1237,5 +1283,112 @@ impl FeeCollector {
     /// provider has not set a preference.
     pub fn get_payout_currency(env: Env, provider: Address) -> Option<Address> {
         get_provider_payout_currency(&env, &provider)
+    }
+
+    // ── Issue #664: Volume-based discount tiers ──────────────────────────────
+
+    /// Admin: set the volume-based discount tier configuration.
+    ///
+    /// `config.tiers` must contain at least 3 entries sorted (or unsorted) by
+    /// `volume_threshold_usd`.  The highest discount for which the user qualifies
+    /// is applied at fee-collection time.
+    pub fn set_volume_discount_config(
+        env: Env,
+        admin: Address,
+        config: VolumeDiscountConfig,
+    ) -> Result<(), ContractError> {
+        if !is_initialized(&env) {
+            return Err(ContractError::NotInitialized);
+        }
+        let stored_admin = get_admin(&env);
+        stored_admin.require_auth();
+        if stored_admin != admin {
+            return Err(ContractError::Unauthorized);
+        }
+        if config.tiers.len() < 3 {
+            return Err(ContractError::InvalidFeeConfiguration);
+        }
+        let tier_count = config.tiers.len();
+        set_volume_discount_config_storage(&env, &config);
+        emit_volume_discount_config_updated(&env, tier_count);
+        Ok(())
+    }
+
+    /// Returns the current admin-configured volume discount tiers, if any.
+    pub fn get_volume_discount_config_fn(env: Env) -> Option<VolumeDiscountConfig> {
+        get_volume_discount_config(&env)
+    }
+
+    // ── Issue #665: Fee revenue forecasting ─────────────────────────────────
+
+    /// Admin: configure the forecast epoch cadence and trailing window.
+    pub fn set_forecast_config(
+        env: Env,
+        admin: Address,
+        config: ForecastConfigData,
+    ) -> Result<(), ContractError> {
+        if !is_initialized(&env) {
+            return Err(ContractError::NotInitialized);
+        }
+        let stored_admin = get_admin(&env);
+        stored_admin.require_auth();
+        if stored_admin != admin {
+            return Err(ContractError::Unauthorized);
+        }
+        if config.epoch_cadence_days == 0 || config.window_days == 0 {
+            return Err(ContractError::InvalidFeeConfiguration);
+        }
+        set_forecast_config_storage(&env, &config);
+        Ok(())
+    }
+
+    /// Returns the current forecast configuration.
+    pub fn get_forecast_config_fn(env: Env) -> ForecastConfigData {
+        get_forecast_config(&env)
+    }
+
+    /// Admin: manually trigger a fee revenue forecast for `token`.
+    ///
+    /// Computes a trailing-average projection and emits a `fee_forecast` event.
+    /// Returns the projected amount for the next epoch.
+    pub fn trigger_fee_forecast(
+        env: Env,
+        admin: Address,
+        token: Address,
+    ) -> Result<i128, ContractError> {
+        if !is_initialized(&env) {
+            return Err(ContractError::NotInitialized);
+        }
+        let stored_admin = get_admin(&env);
+        stored_admin.require_auth();
+        if stored_admin != admin {
+            return Err(ContractError::Unauthorized);
+        }
+        let cfg = get_forecast_config(&env);
+        let current_day = env.ledger().timestamp() / SECONDS_PER_DAY_FC;
+        let window = cfg.window_days;
+        let mut total: i128 = 0;
+        let mut days_with_data: u64 = 0;
+        let mut i: u64 = 0;
+        while i < window {
+            let day = current_day.saturating_sub(i);
+            let daily_total = get_daily_fee_total(&env, &token, day);
+            if daily_total > 0 {
+                total = total.saturating_add(daily_total);
+                days_with_data = days_with_data.saturating_add(1);
+            }
+            i = i.saturating_add(1);
+        }
+        let projected = if days_with_data > 0 {
+            total
+                .checked_div(days_with_data as i128)
+                .and_then(|avg| avg.checked_mul(cfg.epoch_cadence_days as i128))
+                .unwrap_or(0)
+        } else {
+            0
+        };
+        emit_fee_forecast(&env, &token, projected, window, current_day);
+        set_last_forecast_day(&env, &token, current_day);
+        Ok(projected)
     }
 }

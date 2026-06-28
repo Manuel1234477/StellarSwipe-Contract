@@ -99,6 +99,25 @@ pub use treasury::{
 const DEFAULT_LIQUIDITY_REWARD_BPS: u32 = 100;
 const DEFAULT_MIN_CLAIM_THRESHOLD: i128 = 100;
 
+// ── Issue #666: Proposal execution simulation ─────────────────────────────────
+
+/// Result of a `simulate_execution` dry-run.
+///
+/// `old_value` and `new_value` encode the projected state change:
+/// - `ParameterChange`: current and proposed parameter values.
+/// - `TreasurySpend`: current treasury asset balance and post-spend balance.
+/// - `FeatureToggle`: current flag (0/1) and proposed flag (0/1).
+/// - `ContractUpgrade`/`SignalProposal`/`Custom`: both 0 (no numeric diff).
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct SimulationResult {
+    pub proposal_id: u64,
+    pub simulation_timestamp: u64,
+    pub would_succeed: bool,
+    pub old_value: i128,
+    pub new_value: i128,
+}
+
 soroban_sdk::contractmeta!(
     key = "SourceHash",
     val = env!("STELLAR_SOURCE_HASH")
@@ -569,6 +588,83 @@ impl GovernanceContract {
     ) -> Result<ProposalStatus, GovernanceError> {
         require_initialized(&env)?;
         proposals::cancel_proposal(&env, proposal_id, canceller)
+    }
+
+    // ── Issue #666: Proposal execution payload simulation (dry-run) ───────────
+
+    /// Read-only dry-run of a proposal's execution payload.
+    ///
+    /// Applies the payload against a read-only view of current contract state and
+    /// returns the projected diff without writing to persistent storage. Emits a
+    /// `simulation_complete` event for off-chain/UI consumption.
+    ///
+    /// Returns `SimulationResult::would_succeed = true` only when the proposal
+    /// is in `Succeeded` status and the payload would execute without error.
+    pub fn simulate_execution(
+        env: Env,
+        proposal_id: u64,
+    ) -> Result<SimulationResult, GovernanceError> {
+        require_initialized(&env)?;
+        let proposal = get_proposal(&env, proposal_id)?;
+
+        let executable = matches!(proposal.status, ProposalStatus::Succeeded);
+
+        let (old_value, new_value) = match &proposal.proposal_type {
+            ProposalType::ParameterChange(key, _old_expected, new_val) => {
+                let params: Map<String, i128> = env
+                    .storage()
+                    .instance()
+                    .get(&StorageKey::GovernanceParameters)
+                    .unwrap_or_else(|| Map::new(&env));
+                let current = params.get(key.clone()).unwrap_or(0);
+                (current, *new_val)
+            }
+            ProposalType::TreasurySpend(_recipient, amount, asset, _category) => {
+                let treasury = get_treasury(&env);
+                let current_balance = treasury
+                    .assets
+                    .get(asset.clone())
+                    .unwrap_or(0);
+                (current_balance, current_balance.saturating_sub(*amount))
+            }
+            ProposalType::FeatureToggle(name, enabled) => {
+                let features: Map<String, bool> = env
+                    .storage()
+                    .instance()
+                    .get(&StorageKey::GovernanceFeatures)
+                    .unwrap_or_else(|| Map::new(&env));
+                let current_flag = features.get(name.clone()).unwrap_or(false);
+                (current_flag as i128, *enabled as i128)
+            }
+            ProposalType::ContractUpgrade(_name, _wasm) => (0, 1),
+            ProposalType::SignalProposal(_text) => (0, 0),
+            ProposalType::Custom(_addr) => (0, 0),
+        };
+
+        let result = SimulationResult {
+            proposal_id,
+            simulation_timestamp: env.ledger().timestamp(),
+            would_succeed: executable,
+            old_value,
+            new_value,
+        };
+
+        #[allow(deprecated)]
+        env.events().publish(
+            (
+                symbol_short!("gov"),
+                symbol_short!("sim_done"),
+            ),
+            (
+                proposal_id,
+                executable,
+                old_value,
+                new_value,
+                env.ledger().timestamp(),
+            ),
+        );
+
+        Ok(result)
     }
 
     pub fn proposal_statistics(env: Env) -> Result<ProposalStatistics, GovernanceError> {

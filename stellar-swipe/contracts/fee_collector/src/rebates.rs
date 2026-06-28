@@ -2,9 +2,10 @@ use soroban_sdk::{Address, Env, IntoVal, Symbol};
 use stellar_swipe_common::{Amount, Asset};
 
 use crate::storage::{
-    get_fee_rate, get_monthly_trade_volume, get_oracle_contract, remove_monthly_trade_volume,
-    set_monthly_trade_volume, MonthlyTradeVolume, GOLD_DISCOUNT_BPS, GOLD_TIER_VOLUME_USD,
-    LEDGERS_PER_MONTH_APPROX, MIN_FEE_RATE_BPS, SILVER_DISCOUNT_BPS, SILVER_TIER_VOLUME_USD,
+    get_fee_rate, get_monthly_trade_volume, get_oracle_contract, get_volume_discount_config,
+    remove_monthly_trade_volume, set_monthly_trade_volume, MonthlyTradeVolume, GOLD_DISCOUNT_BPS,
+    GOLD_TIER_VOLUME_USD, LEDGERS_PER_MONTH_APPROX, MIN_FEE_RATE_BPS, SILVER_DISCOUNT_BPS,
+    SILVER_TIER_VOLUME_USD,
 };
 use crate::ContractError;
 
@@ -32,6 +33,19 @@ pub fn get_fee_rate_for_user(env: &Env, user: &Address) -> u32 {
     let base_rate = get_fee_rate(env);
     let volume_usd = get_active_volume_usd(env, user);
 
+    // Admin-configured tiers take precedence over hardcoded defaults (#664).
+    if let Some(config) = get_volume_discount_config(env) {
+        let mut best_discount: u32 = 0;
+        for i in 0..config.tiers.len() {
+            let tier = config.tiers.get(i).unwrap();
+            if volume_usd >= tier.volume_threshold_usd && tier.discount_bps > best_discount {
+                best_discount = tier.discount_bps;
+            }
+        }
+        return base_rate.saturating_sub(best_discount).max(MIN_FEE_RATE_BPS);
+    }
+
+    // Fallback: hardcoded two-tier defaults.
     if volume_usd >= GOLD_TIER_VOLUME_USD {
         base_rate
             .saturating_sub(GOLD_DISCOUNT_BPS)

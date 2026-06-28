@@ -129,6 +129,15 @@ pub enum StorageKey {
     ProviderDelegatedStakes(Address),
     /// Cached total amount delegated to a provider across all delegators (issue #688).
     ProviderTotalDelegated(Address),
+    // ── Issue #663: Unstake request queue ──────────────────────────────────────
+    /// Next ticket number to assign (tail of queue).
+    UnstakeQueueTail,
+    /// Next ticket number to process (head of queue).
+    UnstakeQueueHead,
+    /// Per-ticket unstake request entry.
+    UnstakeQueueEntry(u64),
+    /// Ticket number assigned to a queued user (for position lookup).
+    UserUnstakeTicket(Address),
 }
 
 #[contracterror]
@@ -156,6 +165,21 @@ pub enum StakeVaultError {
     StakeDurationNotElapsed = 12,
     /// No delegated stake found for the given delegator/provider pair.
     NoDelegatedStake = 13,
+    /// User already has a pending unstake request in the queue.
+    UnstakeAlreadyQueued = 14,
+    /// No unstake request found for this user.
+    NoUnstakeQueued = 15,
+    /// Unstake queue is empty.
+    QueueEmpty = 16,
+}
+
+/// A pending unstake request held in the FIFO queue (issue #663).
+#[contracttype]
+#[derive(Clone)]
+pub struct UnstakeRequest {
+    pub ticket: u64,
+    pub user: Address,
+    pub queued_at: u64,
 }
 
 soroban_sdk::contractmeta!(
@@ -954,6 +978,178 @@ impl StakeVaultContract {
         let own = Self::get_stake(env.clone(), provider.clone());
         let delegated = Self::get_total_delegated(env, provider);
         own.saturating_add(delegated)
+    }
+
+    // ── Issue #663: Unstake request queue ─────────────────────────────────────
+
+    /// Queue an unstake request for `staker`.
+    ///
+    /// The request is assigned a sequential ticket number and placed at the tail
+    /// of the FIFO queue. The staker must have a positive stake balance and must
+    /// not already have a pending request in the queue.
+    ///
+    /// Emits `unstake_queued` with the assigned ticket number and queue position.
+    pub fn queue_unstake(env: Env, staker: Address) -> Result<u64, StakeVaultError> {
+        staker.require_auth();
+        Self::require_not_paused(&env)?;
+
+        if env
+            .storage()
+            .persistent()
+            .has(&StorageKey::UserUnstakeTicket(staker.clone()))
+        {
+            return Err(StakeVaultError::UnstakeAlreadyQueued);
+        }
+
+        let stakes: soroban_sdk::Map<Address, StakeInfoV2> = env
+            .storage()
+            .persistent()
+            .get(&MigrationKey::StakesV2)
+            .unwrap_or_else(|| soroban_sdk::Map::new(&env));
+        let info = stakes.get(staker.clone()).ok_or(StakeVaultError::NoStake)?;
+        if info.balance == 0 {
+            return Err(StakeVaultError::NoStake);
+        }
+
+        let tail: u64 = env
+            .storage()
+            .instance()
+            .get(&StorageKey::UnstakeQueueTail)
+            .unwrap_or(0);
+        let head: u64 = env
+            .storage()
+            .instance()
+            .get(&StorageKey::UnstakeQueueHead)
+            .unwrap_or(0);
+
+        let ticket = tail;
+        let queue_position = tail.saturating_sub(head);
+
+        let request = UnstakeRequest {
+            ticket,
+            user: staker.clone(),
+            queued_at: env.ledger().timestamp(),
+        };
+
+        env.storage()
+            .persistent()
+            .set(&StorageKey::UnstakeQueueEntry(ticket), &request);
+        env.storage()
+            .persistent()
+            .set(&StorageKey::UserUnstakeTicket(staker.clone()), &ticket);
+        env.storage()
+            .instance()
+            .set(&StorageKey::UnstakeQueueTail, &tail.saturating_add(1));
+
+        #[allow(deprecated)]
+        env.events().publish(
+            (
+                Symbol::new(&env, "stake_vault"),
+                Symbol::new(&env, "unstake_queued"),
+            ),
+            (staker, ticket, queue_position),
+        );
+
+        Ok(ticket)
+    }
+
+    /// Process up to `limit` queued unstake requests in FIFO order.
+    ///
+    /// Requests are processed from the queue head. A request that fails (e.g.
+    /// due to a time-lock or locked stake) is left at the head; processing stops
+    /// so strict FIFO ordering is preserved. The caller should retry later once
+    /// the blocking condition is resolved.
+    ///
+    /// Returns the number of requests successfully processed.
+    pub fn process_unstake_queue(env: Env, limit: u32) -> Result<u32, StakeVaultError> {
+        Self::require_not_paused(&env)?;
+
+        if limit == 0 {
+            return Ok(0);
+        }
+
+        let head: u64 = env
+            .storage()
+            .instance()
+            .get(&StorageKey::UnstakeQueueHead)
+            .unwrap_or(0);
+        let tail: u64 = env
+            .storage()
+            .instance()
+            .get(&StorageKey::UnstakeQueueTail)
+            .unwrap_or(0);
+
+        if head >= tail {
+            return Err(StakeVaultError::QueueEmpty);
+        }
+
+        let mut processed: u32 = 0;
+        let mut current_head = head;
+
+        while processed < limit && current_head < tail {
+            let entry_key = StorageKey::UnstakeQueueEntry(current_head);
+            let request: UnstakeRequest = match env.storage().persistent().get(&entry_key) {
+                Some(r) => r,
+                None => {
+                    // Orphaned slot — advance head and continue.
+                    current_head = current_head.saturating_add(1);
+                    continue;
+                }
+            };
+
+            match Self::do_withdraw(&env, &request.user) {
+                Ok(amount) => {
+                    env.storage().persistent().remove(&entry_key);
+                    env.storage()
+                        .persistent()
+                        .remove(&StorageKey::UserUnstakeTicket(request.user.clone()));
+                    current_head = current_head.saturating_add(1);
+                    processed = processed.saturating_add(1);
+
+                    stellar_swipe_common::rate_limit::record_action(
+                        &env,
+                        &request.user,
+                        stellar_swipe_common::rate_limit::ActionType::StakeChange,
+                    );
+
+                    #[allow(deprecated)]
+                    env.events().publish(
+                        (
+                            Symbol::new(&env, "stake_vault"),
+                            Symbol::new(&env, "unstake_processed"),
+                        ),
+                        (request.user, request.ticket, amount),
+                    );
+                }
+                Err(_) => {
+                    // Blocked — stop processing to preserve FIFO order.
+                    break;
+                }
+            }
+        }
+
+        env.storage()
+            .instance()
+            .set(&StorageKey::UnstakeQueueHead, &current_head);
+
+        Ok(processed)
+    }
+
+    /// Returns the zero-based queue position for `user`, or `None` if the user
+    /// has no pending unstake request.
+    ///
+    /// Position 0 means the user is next to be processed.
+    pub fn get_queue_position(env: Env, user: Address) -> Option<u64> {
+        let ticket: u64 = env
+            .storage()
+            .persistent()
+            .get(&StorageKey::UserUnstakeTicket(user))?;
+        let head: u64 = env
+            .storage()
+            .instance()
+            .get(&StorageKey::UnstakeQueueHead)
+            .unwrap_or(0);
+        Some(ticket.saturating_sub(head))
     }
 }
 
