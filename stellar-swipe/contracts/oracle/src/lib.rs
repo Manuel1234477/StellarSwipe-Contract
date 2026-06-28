@@ -36,6 +36,15 @@ pub use history::{calculate_twap, get_historical_price, get_twap_deviation, stor
 pub use multi_hop::{calculate_multi_hop_price, find_optimal_path, LiquidityPath};
 pub use storage::{get_base_currency, get_price, set_base_currency, set_price};
 
+soroban_sdk::contractmeta!(
+    key = "SourceHash",
+    val = env!("STELLAR_SOURCE_HASH")
+);
+soroban_sdk::contractmeta!(
+    key = "GitCommit",
+    val = env!("STELLAR_GIT_COMMIT")
+);
+
 #[contract]
 pub struct OracleContract;
 

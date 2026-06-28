@@ -158,6 +158,15 @@ pub enum StakeVaultError {
     NoDelegatedStake = 13,
 }
 
+soroban_sdk::contractmeta!(
+    key = "SourceHash",
+    val = env!("STELLAR_SOURCE_HASH")
+);
+soroban_sdk::contractmeta!(
+    key = "GitCommit",
+    val = env!("STELLAR_GIT_COMMIT")
+);
+
 #[contract]
 pub struct StakeVaultContract;
 
