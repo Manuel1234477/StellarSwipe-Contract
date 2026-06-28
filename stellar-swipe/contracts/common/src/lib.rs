@@ -16,6 +16,7 @@ pub mod rate_limit;
 #[allow(deprecated)]
 pub mod replay_protection;
 pub mod ttl_manager;
+pub mod budget_regression;
 
 pub use amm_bridge::{
     build_fallback_chain, emit_fallback_used, emit_quote_discovered, emit_route_planned,
@@ -63,6 +64,7 @@ pub use ttl_manager::{
     bump_persistent_if_needed, force_bump_persistent, HOT_KEY_TTL_TARGET_LEDGERS,
     HOT_KEY_TTL_THRESHOLD_LEDGERS,
 };
+pub use budget_regression::{assert_within_budget, REGRESSION_THRESHOLD_PCT};
 
 #[cfg(test)]
 mod storage_key_tests;

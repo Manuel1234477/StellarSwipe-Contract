@@ -57,6 +57,17 @@ jobs:
       - name: Tests
         run: cd stellar-swipe && cargo test --workspace --all-targets
 
+      # CPU instruction-budget regression gate.
+      # Runs tests, captures BUDGET_METRIC lines, and fails if any entrypoint
+      # exceeds its committed baseline by more than the configured threshold.
+      # To update the baseline: run scripts/update_budget_baseline.sh locally,
+      # commit the updated baselines/instruction_budget_baseline.json, and add
+      # a PR description explaining why the regression is expected/accepted.
+      - name: Budget regression check
+        run: |
+          cd stellar-swipe && cargo test --workspace --all-targets 2>&1 \
+            | python3 scripts/check_budget_baseline.py
+
       # Audit dependency versions consistency
       - name: Audit workspace dependencies
         run: python3 stellar-swipe/scripts/audit_dependencies.py
