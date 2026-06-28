@@ -261,6 +261,42 @@ pub fn emit_payout_currency_set(env: &Env, provider: &Address, preferred_token: 
     );
 }
 
+// ── #665: Fee Forecast event ─────────────────────────────────────────────────
+
+/// Emitted when a fee revenue forecast is computed (auto or manual trigger).
+pub fn emit_fee_forecast(
+    env: &Env,
+    token: &Address,
+    projected_amount: i128,
+    basis_window_days: u64,
+    current_epoch_day: u64,
+) {
+    env.events().publish(
+        (
+            Symbol::new(env, "fee_collector"),
+            Symbol::new(env, "fee_forecast"),
+        ),
+        (
+            token.clone(),
+            projected_amount,
+            basis_window_days,
+            current_epoch_day,
+        ),
+    );
+}
+
+// ── #664: Volume Discount Config Updated event ───────────────────────────────
+
+pub fn emit_volume_discount_config_updated(env: &Env, tier_count: u32) {
+    env.events().publish(
+        (
+            Symbol::new(env, "fee_collector"),
+            Symbol::new(env, "vol_discount_updated"),
+        ),
+        (tier_count,),
+    );
+}
+
 pub fn emit_fees_claimed_converted(
     env: &Env,
     provider: &Address,
