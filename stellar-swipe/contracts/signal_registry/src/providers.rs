@@ -15,6 +15,92 @@ pub const GOLD_TIER_STAKE: i128 = 1_000_000_000;
 pub const MIN_CLOSED_SIGNALS: u32 = 20;
 pub const MIN_SUCCESS_RATE_BPS: u32 = 6_000;
 
+// ─── Provider specialization tags (Issue #704) ───────────────────────────────
+
+/// Maximum number of specialization tags a single provider may select.
+pub const MAX_SPECIALIZATION_TAGS_PER_PROVIDER: u32 = 3;
+
+/// Maximum length of a specialization tag string (in bytes).
+pub const MAX_SPECIALIZATION_TAG_LENGTH: u32 = 32;
+
+/// Maximum number of admin-defined specialization tags.
+pub const MAX_ADMIN_SPECIALIZATION_TAGS: u32 = 50;
+
+/// Storage key for provider specialization tags.
+#[contracttype]
+#[derive(Clone)]
+pub enum SpecializationStorageKey {
+    /// Admin-defined set of valid specialization tags.
+    SpecializationTags,
+    /// Per-provider: the list of specialization tags they self-selected.
+    /// Stored as `Vec<String>`.
+    ProviderSpecializations(Address),
+    /// Reverse index: tag -> Vec<Address> of providers with that tag.
+    ProvidersBySpecialization(soroban_sdk::String),
+}
+
+/// Add a specialization tag to the admin-defined set.
+pub fn add_specialization_tag(env: &Env, admin: &Address, tag: String) -> Result<(), ()> {
+    admin.require_auth();
+    if tag.len() == 0 || tag.len() > MAX_SPECIALIZATION_TAG_LENGTH {
+        panic!("tag length out of bounds");
+    }
+
+    let mut tags: soroban_sdk::Vec<String> = env
+        .storage()
+        .instance()
+        .get(&SpecializationStorageKey::SpecializationTags)
+        .unwrap_or_else(|| soroban_sdk::Vec::new(env));
+
+    for i in 0..tags.len() {
+        if let Some(t) = tags.get(i) {
+            if t == tag {
+                return Ok(());
+            }
+        }
+    }
+
+    if tags.len() >= MAX_ADMIN_SPECIALIZATION_TAGS {
+        panic!("max specialization tags reached");
+    }
+
+    tags.push_back(tag);
+    env.storage()
+        .instance()
+        .set(&SpecializationStorageKey::SpecializationTags, &tags);
+    Ok(())
+}
+
+/// Remove a specialization tag from the admin-defined set.
+pub fn remove_specialization_tag(env: &Env, admin: &Address, tag: String) {
+    admin.require_auth();
+    let mut tags: soroban_sdk::Vec<String> = env
+        .storage()
+        .instance()
+        .get(&SpecializationStorageKey::SpecializationTags)
+        .unwrap_or_else(|| soroban_sdk::Vec::new(env));
+
+    let mut updated = soroban_sdk::Vec::new(env);
+    for i in 0..tags.len() {
+        if let Some(t) = tags.get(i) {
+            if t != tag {
+                updated.push_back(t);
+            }
+        }
+    }
+    env.storage()
+        .instance()
+        .set(&SpecializationStorageKey::SpecializationTags, &updated);
+}
+
+/// Returns the admin-defined set of specialization tags.
+pub fn get_specialization_tags(env: &Env) -> soroban_sdk::Vec<String> {
+    env.storage()
+        .instance()
+        .get(&SpecializationStorageKey::SpecializationTags)
+        .unwrap_or_else(|| soroban_sdk::Vec::new(env))
+}
+
 // ─── Provider Profile (Task 3) ────────────────────────────────────────────────
 
 /// On-chain provider profile. Content (display name, bio) is stored off-chain;
@@ -300,8 +386,127 @@ pub fn check_verification_eligibility(
     }
 }
 
-// ═══════════════════════════════════════════════════════════════════
-// Issue #424: Provider Ban Mechanism
+/// Set the specialization tags for a provider (self-selected).
+/// Replaces any existing tags for this provider.
+/// Validates that all tags are in the admin-defined set and within count limits.
+pub fn set_provider_specializations(
+    env: &Env,
+    provider: &Address,
+    tags: soroban_sdk::Vec<String>,
+) {
+    provider.require_auth();
+
+    if tags.len() > MAX_SPECIALIZATION_TAGS_PER_PROVIDER {
+        panic!("provider may select at most {MAX_SPECIALIZATION_TAGS_PER_PROVIDER} specialization tags");
+    }
+
+    let valid_tags: soroban_sdk::Vec<String> = env
+        .storage()
+        .instance()
+        .get(&SpecializationStorageKey::SpecializationTags)
+        .unwrap_or_else(|| soroban_sdk::Vec::new(env));
+
+    for i in 0..tags.len() {
+        if let Some(tag) = tags.get(i) {
+            if tag.len() == 0 || tag.len() > MAX_SPECIALIZATION_TAG_LENGTH {
+                panic!("invalid tag length");
+            }
+            let mut found = false;
+            for j in 0..valid_tags.len() {
+                if let Some(vt) = valid_tags.get(j) {
+                    if vt == tag {
+                        found = true;
+                        break;
+                    }
+                }
+            }
+            if !found {
+                panic!("tag is not in the admin-defined set");
+            }
+        }
+    }
+
+    // Remove old reverse index entries.
+    let old_key = SpecializationStorageKey::ProviderSpecializations(provider.clone());
+    if let Some(old_tags) = env
+        .storage()
+        .persistent()
+        .get::<_, soroban_sdk::Vec<String>>(&old_key)
+    {
+        for i in 0..old_tags.len() {
+            if let Some(old_tag) = old_tags.get(i) {
+                let rev_key = SpecializationStorageKey::ProvidersBySpecialization(old_tag);
+                let mut providers: soroban_sdk::Vec<Address> = env
+                    .storage()
+                    .persistent()
+                    .get(&rev_key)
+                    .unwrap_or_else(|| soroban_sdk::Vec::new(env));
+                let mut updated = soroban_sdk::Vec::new(env);
+                for j in 0..providers.len() {
+                    if let Some(p) = providers.get(j) {
+                        if p != *provider {
+                            updated.push_back(p);
+                        }
+                    }
+                }
+                if updated.len() > 0 {
+                    env.storage().persistent().set(&rev_key, &updated);
+                } else {
+                    env.storage().persistent().remove(&rev_key);
+                }
+            }
+        }
+    }
+
+    // Store new tags and update reverse index.
+    env.storage().persistent().set(&old_key, &tags);
+    for i in 0..tags.len() {
+        if let Some(tag) = tags.get(i) {
+            let rev_key = SpecializationStorageKey::ProvidersBySpecialization(tag);
+            let mut providers: soroban_sdk::Vec<Address> = env
+                .storage()
+                .persistent()
+                .get(&rev_key)
+                .unwrap_or_else(|| soroban_sdk::Vec::new(env));
+            let mut already = false;
+            for j in 0..providers.len() {
+                if let Some(p) = providers.get(j) {
+                    if p == *provider {
+                        already = true;
+                        break;
+                    }
+                }
+            }
+            if !already {
+                providers.push_back(provider.clone());
+                env.storage().persistent().set(&rev_key, &providers);
+            }
+        }
+    }
+}
+
+/// Returns the specialization tags for a given provider.
+pub fn get_provider_specializations(
+    env: &Env,
+    provider: &Address,
+) -> soroban_sdk::Vec<String> {
+    env.storage()
+        .persistent()
+        .get(&SpecializationStorageKey::ProviderSpecializations(provider.clone()))
+        .unwrap_or_else(|| soroban_sdk::Vec::new(env))
+}
+
+/// Returns all providers that have selected the given specialization tag.
+pub fn list_providers_by_specialization(
+    env: &Env,
+    tag: soroban_sdk::String,
+) -> soroban_sdk::Vec<Address> {
+    env.storage()
+        .persistent()
+        .get(&SpecializationStorageKey::ProvidersBySpecialization(tag))
+        .unwrap_or_else(|| soroban_sdk::Vec::new(env))
+}
+
 // ═══════════════════════════════════════════════════════════════════
 
 /// Check if a provider is banned (presence of ban reason indicates banned status)
@@ -656,5 +861,130 @@ mod tests {
         assert!(!eligibility.history_ok);
         assert!(!eligibility.success_rate_ok);
         assert_eq!(eligibility.missing_criteria.len(), 3);
+    }
+
+    // ── Provider specialization tag tests (Issue #704) ──────────────────────
+
+    #[test]
+    fn add_and_list_specialization_tags() {
+        with_contract(|env| {
+            let admin = Address::generate(env);
+            let provider1 = Address::generate(env);
+            let provider2 = Address::generate(env);
+
+            // Add admin-defined tags
+            add_specialization_tag(env, &admin, String::from_str(env, "DeFi")).unwrap();
+            add_specialization_tag(env, &admin, String::from_str(env, "Forex")).unwrap();
+
+            let tags = get_specialization_tags(env);
+            assert_eq!(tags.len(), 2);
+
+            // Set provider specializations
+            let mut p1_tags = soroban_sdk::Vec::new(env);
+            p1_tags.push_back(String::from_str(env, "DeFi"));
+            set_provider_specializations(env, &provider1, p1_tags);
+
+            let mut p2_tags = soroban_sdk::Vec::new(env);
+            p2_tags.push_back(String::from_str(env, "Forex"));
+            set_provider_specializations(env, &provider2, p2_tags);
+
+            // List by tag
+            let defi_providers = list_providers_by_specialization(env, String::from_str(env, "DeFi"));
+            assert_eq!(defi_providers.len(), 1);
+            assert_eq!(defi_providers.get(0).unwrap(), provider1);
+        });
+    }
+
+    #[test]
+    fn tag_count_limit_enforced() {
+        with_contract(|env| {
+            let admin = Address::generate(env);
+            let provider = Address::generate(env);
+
+            add_specialization_tag(env, &admin, String::from_str(env, "DeFi")).unwrap();
+            add_specialization_tag(env, &admin, String::from_str(env, "Forex")).unwrap();
+            add_specialization_tag(env, &admin, String::from_str(env, "Large-cap")).unwrap();
+            add_specialization_tag(env, &admin, String::from_str(env, "Crypto")).unwrap();
+
+            // Try to set 4 tags (limit is 3)
+            let mut tags = soroban_sdk::Vec::new(env);
+            tags.push_back(String::from_str(env, "DeFi"));
+            tags.push_back(String::from_str(env, "Forex"));
+            tags.push_back(String::from_str(env, "Large-cap"));
+            tags.push_back(String::from_str(env, "Crypto"));
+
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                set_provider_specializations(env, &provider, tags);
+            }));
+            assert!(result.is_err());
+        });
+    }
+
+    #[test]
+    fn unknown_tag_rejected() {
+        with_contract(|env| {
+            let admin = Address::generate(env);
+            let provider = Address::generate(env);
+
+            add_specialization_tag(env, &admin, String::from_str(env, "DeFi")).unwrap();
+
+            let mut tags = soroban_sdk::Vec::new(env);
+            tags.push_back(String::from_str(env, "UnknownTag"));
+
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                set_provider_specializations(env, &provider, tags);
+            }));
+            assert!(result.is_err());
+        });
+    }
+
+    #[test]
+    fn provider_can_retag() {
+        with_contract(|env| {
+            let admin = Address::generate(env);
+            let provider = Address::generate(env);
+
+            add_specialization_tag(env, &admin, String::from_str(env, "DeFi")).unwrap();
+            add_specialization_tag(env, &admin, String::from_str(env, "Forex")).unwrap();
+
+            let mut tags1 = soroban_sdk::Vec::new(env);
+            tags1.push_back(String::from_str(env, "DeFi"));
+            set_provider_specializations(env, &provider, tags1);
+
+            let stored1 = get_provider_specializations(env, &provider);
+            assert_eq!(stored1.len(), 1);
+            assert_eq!(stored1.get(0).unwrap(), String::from_str(env, "DeFi"));
+
+            // Retag
+            let mut tags2 = soroban_sdk::Vec::new(env);
+            tags2.push_back(String::from_str(env, "Forex"));
+            set_provider_specializations(env, &provider, tags2);
+
+            let stored2 = get_provider_specializations(env, &provider);
+            assert_eq!(stored2.len(), 1);
+            assert_eq!(stored2.get(0).unwrap(), String::from_str(env, "Forex"));
+
+            // Old tag should no longer list the provider
+            let defi_providers = list_providers_by_specialization(env, String::from_str(env, "DeFi"));
+            assert_eq!(defi_providers.len(), 0);
+        });
+    }
+
+    #[test]
+    fn remove_specialization_tag_works() {
+        with_contract(|env| {
+            let admin = Address::generate(env);
+
+            add_specialization_tag(env, &admin, String::from_str(env, "DeFi")).unwrap();
+            add_specialization_tag(env, &admin, String::from_str(env, "Forex")).unwrap();
+
+            assert_eq!(get_specialization_tags(env).len(), 2);
+
+            remove_specialization_tag(env, &admin, String::from_str(env, "DeFi"));
+
+            let remaining = get_specialization_tags(env);
+            assert_eq!(remaining.len(), 1);
+            assert_eq!(remaining.get(0).unwrap(), String::from_str(env, "Forex"));
+        });
     }
 }

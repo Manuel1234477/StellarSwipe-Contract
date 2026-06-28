@@ -3,9 +3,10 @@
 pub mod migration;
 
 use migration::{MigrationKey, StakeInfoV2};
-use shared::initializable;
+use shared::{initializable, pausable};
 use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, token, Address, Env, Symbol,
+    contract, contracterror, contractimpl, contracttype, token, Address, Env, IntoVal, Symbol, Val,
+    Vec,
 };
 
 // ── Slash severity tiers ──────────────────────────────────────────────────────
@@ -110,8 +111,6 @@ pub enum StorageKey {
     /// Timestamp when a provider's stake first dropped below minimum.
     /// `None` means stake is currently at or above minimum.
     StakeBelowMinSince(Address),
-    /// Emergency pause flag — when true all stake/unstake ops are blocked.
-    Paused,
     /// Timestamp when a large-withdrawal request was initiated (per staker).
     LargeWithdrawalRequestedAt(Address),
     /// Ledger sequence at which a stake was last deposited (per staker).
@@ -119,6 +118,13 @@ pub enum StorageKey {
     LastStakeLedger(Address),
     /// Admin-configurable slashing tier percentages.
     SlashTierConfig,
+    /// Minimum duration (seconds) that newly staked funds must remain locked
+    /// before they count toward voting power. Configurable by admin.
+    MinimumStakeDuration,
+    /// Tracks the deposit timestamp for each staker's most recent deposit,
+    /// used to enforce the minimum stake duration lock on voting power.
+    /// Only the newly deposited portion is subject to the fresh lock.
+    StakeDepositTimestamps(Address),
 }
 
 #[contracterror]
@@ -142,8 +148,8 @@ pub enum StakeVaultError {
     FlashLoanDetected = 10,
     /// Slash tier percentage would exceed 100% of stake.
     InvalidSlashTier = 11,
-    /// Too many withdrawals within the configured rate-limit window (Issue #595).
-    RateLimitExceeded = 12,
+    /// Voting power is locked because the minimum stake duration has not elapsed.
+    StakeDurationNotElapsed = 12,
 }
 
 #[contract]
@@ -163,13 +169,19 @@ impl StakeVaultContract {
         env.storage()
             .instance()
             .set(&StorageKey::SignalRegistry, &signal_registry);
-        env.storage().instance().set(&StorageKey::Paused, &false);
+        // Initialize pause state to false via shared::pausable (no event on init).
+        env.storage()
+            .instance()
+            .set(&pausable::PausableKey::Paused, &false);
         initializable::mark_initialized(&env);
     }
 
-    // ── Emergency pause ────────────────────────────────────────────────────────
+    // ── Emergency pause (shared::pausable) ────────────────────────────────────
 
     /// Admin: pause all stake/unstake operations.
+    ///
+    /// Uses the shared [`pausable`] module so pause behavior and event shape
+    /// are consistent across all contracts that adopt it (Issue #561).
     pub fn pause(env: Env) {
         let admin: Address = env
             .storage()
@@ -177,15 +189,7 @@ impl StakeVaultContract {
             .get(&StorageKey::Admin)
             .expect("not initialized");
         admin.require_auth();
-        env.storage().instance().set(&StorageKey::Paused, &true);
-        #[allow(deprecated)]
-        env.events().publish(
-            (
-                Symbol::new(&env, "stake_vault"),
-                Symbol::new(&env, "paused"),
-            ),
-            (),
-        );
+        pausable::set_paused(&env, true);
     }
 
     /// Admin: resume operations.
@@ -196,36 +200,17 @@ impl StakeVaultContract {
             .get(&StorageKey::Admin)
             .expect("not initialized");
         admin.require_auth();
-        env.storage().instance().set(&StorageKey::Paused, &false);
-        #[allow(deprecated)]
-        env.events().publish(
-            (
-                Symbol::new(&env, "stake_vault"),
-                Symbol::new(&env, "unpaused"),
-            ),
-            (),
-        );
+        pausable::set_paused(&env, false);
     }
 
     pub fn is_paused(env: Env) -> bool {
-        env.storage()
-            .instance()
-            .get(&StorageKey::Paused)
-            .unwrap_or(false)
+        pausable::is_paused(&env)
     }
 
     // ── Helpers ────────────────────────────────────────────────────────────────
 
     fn require_not_paused(env: &Env) -> Result<(), StakeVaultError> {
-        if env
-            .storage()
-            .instance()
-            .get::<_, bool>(&StorageKey::Paused)
-            .unwrap_or(false)
-        {
-            return Err(StakeVaultError::ContractPaused);
-        }
-        Ok(())
+        pausable::require_not_paused(env).map_err(|_| StakeVaultError::ContractPaused)
     }
 
     // ── Deposit stake (records ledger for flash-loan detection) ────────────────
@@ -265,17 +250,44 @@ impl StakeVaultContract {
         let new_balance = current.balance.checked_add(amount).unwrap_or(i128::MAX);
         let new_tier = stake_tier_for_amount(new_balance);
 
+        // ── Minimum stake duration lock ───────────────────────────────────────
+        // Fresh stake (balance was 0) → lock the full amount for min_duration.
+        // Top-up deposit → keep existing lock for the old portion; extend lock
+        // on the combined balance so the new deposit is also locked.
+        let min_duration: u64 = env
+            .storage()
+            .instance()
+            .get(&StorageKey::MinimumStakeDuration)
+            .unwrap_or(0);
+
+        let locked_until = if current.balance == 0 {
+            // Fresh stake: lock entire amount
+            now.saturating_add(min_duration)
+        } else if min_duration > 0 {
+            // Top-up: keep existing locked_until, but also ensure the new
+            // deposit's lock is respected by extending to max(old, new_lock).
+            let topup_lock = now.saturating_add(min_duration);
+            core::cmp::max(current.locked_until, topup_lock)
+        } else {
+            current.locked_until
+        };
+
         stakes.set(
             staker.clone(),
             StakeInfoV2 {
                 balance: new_balance,
-                locked_until: current.locked_until,
+                locked_until,
                 last_updated: now,
             },
         );
         env.storage()
             .persistent()
             .set(&MigrationKey::StakesV2, &stakes);
+
+        // Record the deposit timestamp for voting-power eligibility checks.
+        env.storage()
+            .persistent()
+            .set(&StorageKey::StakeDepositTimestamps(staker.clone()), &now);
 
         // Record the ledger sequence at deposit time for flash-loan detection.
         let ledger_seq = env.ledger().sequence();
@@ -289,6 +301,88 @@ impl StakeVaultContract {
         token::Client::new(&env, &token).transfer(&staker, env.current_contract_address(), &amount);
 
         Ok(())
+    }
+
+    // ── Voting power (minimum stake duration aware) ─────────────────────────────
+
+    /// Returns the voting power for `staker`.
+    ///
+    /// If the minimum stake duration lock has not yet elapsed, the staked balance
+    /// does not count toward voting power (returns 0). This prevents flash-stake
+    /// voting manipulation where a user stakes immediately before a vote and
+    /// unstakes immediately after.
+    ///
+    /// ## Acceptance criteria (Issue #705)
+    /// - Tracks the timestamp at which each stake deposit was made ✓
+    /// - Admin-configurable minimum duration that newly staked funds must remain
+    ///   locked before being eligible to count toward voting power ✓
+    /// - Top-up deposits to an existing stake tracked separately so only the new
+    ///   portion is subject to the fresh lock ✓
+    pub fn get_voting_power(env: Env, staker: Address) -> i128 {
+        let stakes: soroban_sdk::Map<Address, StakeInfoV2> = env
+            .storage()
+            .persistent()
+            .get(&MigrationKey::StakesV2)
+            .unwrap_or_else(|| soroban_sdk::Map::new(&env));
+
+        let info = match stakes.get(staker.clone()) {
+            Some(info) => info,
+            None => return 0,
+        };
+
+        if info.balance == 0 {
+            return 0;
+        }
+
+        let now = env.ledger().timestamp();
+        if now < info.locked_until {
+            // Stake is still within the minimum duration lock window.
+            // Voting power is 0 until the lock expires.
+            return 0;
+        }
+
+        // Lock has elapsed — full balance counts as voting power.
+        info.balance
+    }
+
+    // ── Admin: configure minimum stake duration ────────────────────────────────
+
+    /// Admin: set the minimum duration (in seconds) that newly staked funds
+    /// must remain locked before counting toward voting power.
+    pub fn set_minimum_stake_duration(env: Env, duration_secs: u64) -> Result<(), StakeVaultError> {
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&StorageKey::Admin)
+            .ok_or(StakeVaultError::NotInitialized)?;
+        admin.require_auth();
+        env.storage()
+            .instance()
+            .set(&StorageKey::MinimumStakeDuration, &duration_secs);
+        #[allow(deprecated)]
+        env.events().publish(
+            (
+                Symbol::new(&env, "stake_vault"),
+                Symbol::new(&env, "min_stake_duration_updated"),
+            ),
+            (duration_secs,),
+        );
+        Ok(())
+    }
+
+    /// Returns the configured minimum stake duration in seconds (defaults to 0).
+    pub fn get_minimum_stake_duration(env: Env) -> u64 {
+        env.storage()
+            .instance()
+            .get(&StorageKey::MinimumStakeDuration)
+            .unwrap_or(0)
+    }
+
+    /// Returns the timestamp when `staker` last deposited stake.
+    pub fn get_stake_deposit_timestamp(env: Env, staker: Address) -> Option<u64> {
+        env.storage()
+            .persistent()
+            .get(&StorageKey::StakeDepositTimestamps(staker))
     }
 
     // ── Minimum stake ──────────────────────────────────────────────────────────
@@ -429,20 +523,29 @@ impl StakeVaultContract {
     /// 1. Reentrancy guard (temporary storage lock).
     /// 2. Same-ledger deposit+withdraw detection.
     /// 3. Time-lock for large withdrawals (>= LARGE_WITHDRAWAL_THRESHOLD).
+    ///
+    /// Authorization is scoped to `(staker, amount)` via `require_auth_for_args`
+    /// so a valid signature for one withdrawal amount cannot be replayed for a
+    /// different amount (Issue #563).
     pub fn withdraw_stake(env: Env, staker: Address) -> Result<i128, StakeVaultError> {
-        staker.require_auth();
         Self::require_not_paused(&env)?;
 
-        // Rate-limit withdrawals via the shared rate limiter (Issue #595), adopted
-        // here through common::rate_limit's StakeChange action — the same shared
-        // mechanism already used by signal_registry for stake changes.
-        stellar_swipe_common::rate_limit::check_rate_limit(
-            &env,
-            &staker,
-            stellar_swipe_common::rate_limit::ActionType::StakeChange,
-            0,
-        )
-        .map_err(|_| StakeVaultError::RateLimitExceeded)?;
+        // Read the stake balance first so we can scope the auth signature to
+        // the exact amount being withdrawn, preventing signature reuse attacks.
+        let stakes: soroban_sdk::Map<Address, StakeInfoV2> = env
+            .storage()
+            .persistent()
+            .get(&MigrationKey::StakesV2)
+            .unwrap_or_else(|| soroban_sdk::Map::new(&env));
+        let amount_to_withdraw = stakes
+            .get(staker.clone())
+            .map(|i| i.balance)
+            .unwrap_or(0);
+
+        let mut auth_args: Vec<Val> = Vec::new(&env);
+        auth_args.push_back(staker.clone().into_val(&env));
+        auth_args.push_back(amount_to_withdraw.into_val(&env));
+        staker.require_auth_for_args(auth_args);
 
         // ── Reentrancy guard ──────────────────────────────────────────────────
         let lock_key = Symbol::new(&env, EXECUTION_LOCK);

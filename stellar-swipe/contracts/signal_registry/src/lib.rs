@@ -2766,6 +2766,40 @@ impl SignalRegistry {
         (highly_trusted, trusted, emerging, new_unproven)
     }
 
+    // ── Provider specialization tags (Issue #704) ─────────────────────────────
+
+    /// Admin: add a specialization tag to the admin-defined set.
+    pub fn add_specialization_tag(env: Env, admin: Address, tag: String) -> Result<(), ()> {
+        providers::add_specialization_tag(&env, &admin, tag)
+    }
+
+    /// Admin: remove a specialization tag from the admin-defined set.
+    pub fn remove_specialization_tag(env: Env, admin: Address, tag: String) {
+        providers::remove_specialization_tag(&env, &admin, tag);
+    }
+
+    /// Returns the admin-defined set of specialization tags.
+    pub fn get_specialization_tags(env: Env) -> Vec<String> {
+        providers::get_specialization_tags(&env)
+    }
+
+    /// Provider: set your specialization tags (self-selected).
+    /// Replaces any existing tags. Validates against admin-defined set
+    /// and enforces the per-provider tag count limit.
+    pub fn set_provider_specializations(env: Env, provider: Address, tags: Vec<String>) {
+        providers::set_provider_specializations(&env, &provider, tags);
+    }
+
+    /// Returns the specialization tags for a given provider.
+    pub fn get_provider_specializations(env: Env, provider: Address) -> Vec<String> {
+        providers::get_provider_specializations(&env, &provider)
+    }
+
+    /// Returns all providers that have selected the given specialization tag.
+    pub fn list_providers_by_specialization(env: Env, tag: String) -> Vec<Address> {
+        providers::list_providers_by_specialization(&env, tag)
+    }
+
     /* =========================
        STORAGE STATS (Issue #3)
     ========================== */
