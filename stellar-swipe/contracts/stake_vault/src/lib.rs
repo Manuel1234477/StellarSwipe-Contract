@@ -153,11 +153,21 @@ pub enum StakeVaultError {
     StakeDurationNotElapsed = 12,
 }
 
+soroban_sdk::contractmeta!(key = "version", val = env!("CARGO_PKG_VERSION"));
+soroban_sdk::contractmeta!(key = "git_commit", val = env!("GIT_COMMIT_HASH"));
+
 #[contract]
 pub struct StakeVaultContract;
 
 #[contractimpl]
 impl StakeVaultContract {
+    pub fn get_build_info(env: Env) -> soroban_sdk::Map<soroban_sdk::String, soroban_sdk::String> {
+        let mut m = soroban_sdk::Map::new(&env);
+        m.set(soroban_sdk::String::from_str(&env, "version"), soroban_sdk::String::from_str(&env, env!("CARGO_PKG_VERSION")));
+        m.set(soroban_sdk::String::from_str(&env, "git_commit"), soroban_sdk::String::from_str(&env, env!("GIT_COMMIT_HASH")));
+        m
+    }
+
     /// One-time initialization (uses shared::initializable guard, issue #584).
     pub fn initialize(env: Env, admin: Address, stake_token: Address, signal_registry: Address) {
         if initializable::is_initialized(&env) {

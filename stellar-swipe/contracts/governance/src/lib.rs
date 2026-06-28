@@ -97,6 +97,9 @@ pub use treasury::{
 const DEFAULT_LIQUIDITY_REWARD_BPS: u32 = 100;
 const DEFAULT_MIN_CLAIM_THRESHOLD: i128 = 100;
 
+soroban_sdk::contractmeta!(key = "version", val = env!("CARGO_PKG_VERSION"));
+soroban_sdk::contractmeta!(key = "git_commit", val = env!("GIT_COMMIT_HASH"));
+
 #[contract]
 pub struct GovernanceContract;
 
@@ -287,6 +290,13 @@ impl GovernanceContract {
         emit_initialized(&env, &admin, &name, &symbol, total_supply);
         emit_distribution_initialized(&env, &distribution);
         Ok(())
+    }
+
+    pub fn get_build_info(env: Env) -> soroban_sdk::Map<soroban_sdk::String, soroban_sdk::String> {
+        let mut m = soroban_sdk::Map::new(&env);
+        m.set(soroban_sdk::String::from_str(&env, "version"), soroban_sdk::String::from_str(&env, env!("CARGO_PKG_VERSION")));
+        m.set(soroban_sdk::String::from_str(&env, "git_commit"), soroban_sdk::String::from_str(&env, env!("GIT_COMMIT_HASH")));
+        m
     }
 
     /// Read-only health probe for monitoring and front-ends (no auth).

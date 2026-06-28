@@ -98,6 +98,9 @@ use versioning::{CopyRecord, SignalVersion};
 const MAX_EXPIRY_SECONDS: u64 = SECONDS_PER_30_DAY_MONTH;
 const WARNING_WINDOW_LEDGERS: u64 = 720;
 
+soroban_sdk::contractmeta!(key = "version", val = env!("CARGO_PKG_VERSION"));
+soroban_sdk::contractmeta!(key = "git_commit", val = env!("GIT_COMMIT_HASH"));
+
 #[contract]
 pub struct SignalRegistry;
 
@@ -424,6 +427,20 @@ impl SignalRegistry {
 
     pub fn get_config(env: Env) -> AdminConfig {
         get_admin_config(&env)
+    }
+
+    /// Returns the semantic version and git commit hash embedded at build time.
+    pub fn get_build_info(env: Env) -> soroban_sdk::Map<soroban_sdk::String, soroban_sdk::String> {
+        let mut m = soroban_sdk::Map::new(&env);
+        m.set(
+            soroban_sdk::String::from_str(&env, "version"),
+            soroban_sdk::String::from_str(&env, env!("CARGO_PKG_VERSION")),
+        );
+        m.set(
+            soroban_sdk::String::from_str(&env, "git_commit"),
+            soroban_sdk::String::from_str(&env, env!("GIT_COMMIT_HASH")),
+        );
+        m
     }
 
     /// Keeper entrypoint: proactively bump TTL for all hot leaderboard keys.
