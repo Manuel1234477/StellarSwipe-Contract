@@ -1101,6 +1101,289 @@ mod slash_severity_tests {
         );
     }
 
+    // ── Issue #662: partial_unstake tests ─────────────────────────────────────
+
+    #[test]
+    fn partial_unstake_reduces_balance_by_requested_amount() {
+        let (env, vault_id, token, _admin, _registry) = setup();
+        let staker = Address::generate(&env);
+        let total: i128 = 1_000_000;
+        let withdraw: i128 = 300_000;
+
+        StellarAssetClient::new(&env, &token).mint(&vault_id, &total);
+        seed(&env, &vault_id, &staker, total);
+
+        let client = StakeVaultContractClient::new(&env, &vault_id);
+        assert_eq!(client.partial_unstake(&staker, &withdraw), withdraw);
+        assert_eq!(client.get_stake(&staker), total - withdraw);
+    }
+
+    #[test]
+    fn partial_unstake_quarter_stake() {
+        let (env, vault_id, token, _admin, _registry) = setup();
+        let staker = Address::generate(&env);
+        let total: i128 = 800_000;
+        let withdraw: i128 = 200_000; // 25%
+
+        StellarAssetClient::new(&env, &token).mint(&vault_id, &total);
+        seed(&env, &vault_id, &staker, total);
+
+        let client = StakeVaultContractClient::new(&env, &vault_id);
+        assert_eq!(client.partial_unstake(&staker, &withdraw), withdraw);
+        assert_eq!(client.get_stake(&staker), 600_000);
+    }
+
+    #[test]
+    fn partial_unstake_half_stake() {
+        let (env, vault_id, token, _admin, _registry) = setup();
+        let staker = Address::generate(&env);
+        let total: i128 = 1_000_000;
+        let withdraw: i128 = 500_000; // 50%
+
+        StellarAssetClient::new(&env, &token).mint(&vault_id, &total);
+        seed(&env, &vault_id, &staker, total);
+
+        let client = StakeVaultContractClient::new(&env, &vault_id);
+        assert_eq!(client.partial_unstake(&staker, &withdraw), withdraw);
+        assert_eq!(client.get_stake(&staker), 500_000);
+    }
+
+    #[test]
+    fn partial_unstake_leaves_one_stroop_remaining() {
+        let (env, vault_id, token, _admin, _registry) = setup();
+        let staker = Address::generate(&env);
+        let total: i128 = 1_000_000;
+        let withdraw: i128 = total - 1; // leaves exactly 1 stroop
+
+        StellarAssetClient::new(&env, &token).mint(&vault_id, &total);
+        seed(&env, &vault_id, &staker, total);
+
+        let client = StakeVaultContractClient::new(&env, &vault_id);
+        assert_eq!(client.partial_unstake(&staker, &withdraw), withdraw);
+        assert_eq!(client.get_stake(&staker), 1);
+    }
+
+    #[test]
+    fn partial_unstake_full_amount_rejected() {
+        let (env, vault_id, token, _admin, _registry) = setup();
+        let staker = Address::generate(&env);
+        let total: i128 = 1_000_000;
+
+        StellarAssetClient::new(&env, &token).mint(&vault_id, &total);
+        seed(&env, &vault_id, &staker, total);
+
+        let result = StakeVaultContractClient::new(&env, &vault_id)
+            .try_partial_unstake(&staker, &total);
+        assert_eq!(result, Err(Ok(StakeVaultError::InvalidAmount)));
+    }
+
+    #[test]
+    fn partial_unstake_zero_amount_rejected() {
+        let (env, vault_id, token, _admin, _registry) = setup();
+        let staker = Address::generate(&env);
+        let total: i128 = 1_000_000;
+
+        StellarAssetClient::new(&env, &token).mint(&vault_id, &total);
+        seed(&env, &vault_id, &staker, total);
+
+        let result = StakeVaultContractClient::new(&env, &vault_id)
+            .try_partial_unstake(&staker, &0i128);
+        assert_eq!(result, Err(Ok(StakeVaultError::InvalidAmount)));
+    }
+
+    #[test]
+    fn partial_unstake_exceeds_balance_rejected() {
+        let (env, vault_id, token, _admin, _registry) = setup();
+        let staker = Address::generate(&env);
+        let total: i128 = 1_000_000;
+
+        StellarAssetClient::new(&env, &token).mint(&vault_id, &total);
+        seed(&env, &vault_id, &staker, total);
+
+        let result = StakeVaultContractClient::new(&env, &vault_id)
+            .try_partial_unstake(&staker, &(total + 1));
+        assert_eq!(result, Err(Ok(StakeVaultError::InvalidAmount)));
+    }
+
+    #[test]
+    fn partial_unstake_no_stake_rejected() {
+        let (env, vault_id, _token, _admin, _registry) = setup();
+        let staker = Address::generate(&env);
+
+        let result = StakeVaultContractClient::new(&env, &vault_id)
+            .try_partial_unstake(&staker, &500_000i128);
+        assert_eq!(result, Err(Ok(StakeVaultError::NoStake)));
+    }
+
+    #[test]
+    fn partial_unstake_below_minimum_rejected() {
+        let (env, vault_id, token, _admin, _registry) = setup();
+        let staker = Address::generate(&env);
+        let total: i128 = 1_000_000;
+        let minimum: i128 = 200_000;
+
+        StellarAssetClient::new(&env, &token).mint(&vault_id, &total);
+        seed(&env, &vault_id, &staker, total);
+
+        let client = StakeVaultContractClient::new(&env, &vault_id);
+        client.set_minimum_stake(&minimum);
+
+        // Withdrawing 900_000 would leave 100_000, which is below minimum (200_000).
+        let result = client.try_partial_unstake(&staker, &900_000i128);
+        assert_eq!(result, Err(Ok(StakeVaultError::RemainingStakeBelowMinimum)));
+    }
+
+    #[test]
+    fn partial_unstake_at_minimum_boundary_succeeds() {
+        let (env, vault_id, token, _admin, _registry) = setup();
+        let staker = Address::generate(&env);
+        let total: i128 = 1_000_000;
+        let minimum: i128 = 200_000;
+
+        StellarAssetClient::new(&env, &token).mint(&vault_id, &total);
+        seed(&env, &vault_id, &staker, total);
+
+        let client = StakeVaultContractClient::new(&env, &vault_id);
+        client.set_minimum_stake(&minimum);
+
+        // Withdrawing exactly enough to leave remaining == minimum.
+        let withdraw = total - minimum; // 800_000
+        assert_eq!(client.partial_unstake(&staker, &withdraw), withdraw);
+        assert_eq!(client.get_stake(&staker), minimum);
+    }
+
+    #[test]
+    fn partial_unstake_one_below_minimum_boundary_rejected() {
+        let (env, vault_id, token, _admin, _registry) = setup();
+        let staker = Address::generate(&env);
+        let total: i128 = 1_000_000;
+        let minimum: i128 = 200_000;
+
+        StellarAssetClient::new(&env, &token).mint(&vault_id, &total);
+        seed(&env, &vault_id, &staker, total);
+
+        let client = StakeVaultContractClient::new(&env, &vault_id);
+        client.set_minimum_stake(&minimum);
+
+        // Leaves remaining == minimum - 1 → rejected.
+        let result = client.try_partial_unstake(&staker, &(total - minimum + 1));
+        assert_eq!(result, Err(Ok(StakeVaultError::RemainingStakeBelowMinimum)));
+    }
+
+    #[test]
+    fn partial_unstake_locked_stake_rejected() {
+        let (env, vault_id, token, _admin, _registry) = setup();
+        let staker = Address::generate(&env);
+        let total: i128 = 1_000_000;
+
+        StellarAssetClient::new(&env, &token).mint(&vault_id, &total);
+        // Seed with far-future lock.
+        super::seed_v2_stake(&env, &vault_id, &staker, total, u64::MAX);
+
+        let result = StakeVaultContractClient::new(&env, &vault_id)
+            .try_partial_unstake(&staker, &500_000i128);
+        assert_eq!(result, Err(Ok(StakeVaultError::StakeLocked)));
+    }
+
+    #[test]
+    fn partial_unstake_flash_loan_blocked() {
+        use soroban_sdk::testutils::Ledger;
+        let (env, vault_id, token, _admin, _registry) = setup();
+        let attacker = Address::generate(&env);
+        let total: i128 = 200_000;
+
+        env.ledger().with_mut(|l| l.sequence_number = 77);
+        StellarAssetClient::new(&env, &token).mint(&attacker, &total);
+        StellarAssetClient::new(&env, &token).mint(&vault_id, &total);
+
+        let client = StakeVaultContractClient::new(&env, &vault_id);
+        client.deposit_stake(&attacker, &total);
+
+        let result = client.try_partial_unstake(&attacker, &(total - 1));
+        assert_eq!(result, Err(Ok(StakeVaultError::FlashLoanDetected)));
+    }
+
+    #[test]
+    fn partial_unstake_large_amount_requires_timelock() {
+        let (env, vault_id, token, _admin, _registry) = setup();
+        let staker = Address::generate(&env);
+        let total: i128 = 1_000_000_000;
+        let withdraw: i128 = 600_000_000; // above LARGE_WITHDRAWAL_THRESHOLD
+
+        StellarAssetClient::new(&env, &token).mint(&vault_id, &total);
+        seed(&env, &vault_id, &staker, total);
+
+        let result = StakeVaultContractClient::new(&env, &vault_id)
+            .try_partial_unstake(&staker, &withdraw);
+        assert_eq!(result, Err(Ok(StakeVaultError::TimelockRequired)));
+    }
+
+    #[test]
+    fn partial_unstake_large_amount_succeeds_after_timelock() {
+        use soroban_sdk::testutils::Ledger;
+        let (env, vault_id, token, _admin, _registry) = setup();
+        let staker = Address::generate(&env);
+        let total: i128 = 1_000_000_000;
+        let withdraw: i128 = 600_000_000;
+
+        StellarAssetClient::new(&env, &token).mint(&vault_id, &total);
+        seed(&env, &vault_id, &staker, total);
+
+        let client = StakeVaultContractClient::new(&env, &vault_id);
+        client.request_withdrawal(&staker);
+        env.ledger().with_mut(|l| l.timestamp += 3_601);
+
+        assert_eq!(client.partial_unstake(&staker, &withdraw), withdraw);
+        assert_eq!(client.get_stake(&staker), total - withdraw);
+    }
+
+    #[test]
+    fn partial_unstake_emits_event() {
+        use soroban_sdk::testutils::Events;
+        let (env, vault_id, token, _admin, _registry) = setup();
+        let staker = Address::generate(&env);
+        let total: i128 = 1_000_000;
+        let withdraw: i128 = 400_000;
+
+        StellarAssetClient::new(&env, &token).mint(&vault_id, &total);
+        seed(&env, &vault_id, &staker, total);
+
+        let events_before = env.events().all().len();
+        StakeVaultContractClient::new(&env, &vault_id).partial_unstake(&staker, &withdraw);
+        assert!(env.events().all().len() > events_before, "partial_unstake event not emitted");
+    }
+
+    #[test]
+    fn partial_unstake_paused_contract_rejected() {
+        let (env, vault_id, token, _admin, _registry) = setup();
+        let staker = Address::generate(&env);
+        let total: i128 = 1_000_000;
+
+        StellarAssetClient::new(&env, &token).mint(&vault_id, &total);
+        seed(&env, &vault_id, &staker, total);
+
+        let client = StakeVaultContractClient::new(&env, &vault_id);
+        client.pause();
+
+        let result = client.try_partial_unstake(&staker, &500_000i128);
+        assert_eq!(result, Err(Ok(StakeVaultError::ContractPaused)));
+    }
+
+    #[test]
+    fn partial_unstake_no_minimum_stake_allows_any_nonzero_remainder() {
+        let (env, vault_id, token, _admin, _registry) = setup();
+        let staker = Address::generate(&env);
+        let total: i128 = 1_000_000;
+
+        StellarAssetClient::new(&env, &token).mint(&vault_id, &total);
+        seed(&env, &vault_id, &staker, total);
+
+        // No minimum set — leaving 1 stroop should be fine.
+        let client = StakeVaultContractClient::new(&env, &vault_id);
+        assert_eq!(client.partial_unstake(&staker, &(total - 1)), total - 1);
+        assert_eq!(client.get_stake(&staker), 1);
+    }
+
     /// Auth scoped to the correct (staker, amount) passes for withdraw_stake.
     #[test]
     fn withdraw_stake_arg_scoped_auth_passes_for_correct_args() {

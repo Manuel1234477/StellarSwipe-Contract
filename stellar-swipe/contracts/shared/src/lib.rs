@@ -24,6 +24,8 @@ pub mod liquidity_pool;
 pub mod math;
 /// Shared emergency-pause state and guard (Issue #561).
 pub mod pausable;
+/// Generic fixed-window rate limiter (Issue #595).
+pub mod rate_limiter;
 #[allow(deprecated)]
 pub mod version;
 

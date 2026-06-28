@@ -340,4 +340,4 @@ mod tests {
         assert_eq!(updated.decimals, 6);
         assert_eq!(updated.issuer, Some(new_issuer));
     }
-
+}
