@@ -1108,6 +1108,52 @@ impl SignalRegistry {
         Ok(())
     }
 
+    /// Edit signal with an append-only audit trail (Issue #686).
+    /// Stores a snapshot of the current signal state before applying changes,
+    /// creating a versioned history that can be retrieved via get_signal_version_history.
+    /// Only the original provider may edit, and only before any follower has
+    /// copy-traded the signal.
+    pub fn edit_signal_audit(
+        env: Env,
+        provider: Address,
+        signal_id: u64,
+        new_price: Option<i128>,
+        new_rationale: Option<soroban_sdk::String>,
+        new_expiry: Option<u64>,
+    ) -> Result<u32, SignalEditError> {
+        provider.require_auth();
+        admin::require_not_paused(&env, String::from_str(&env, CAT_SIGNALS))
+            .map_err(|_| SignalEditError::TradingPaused)?;
+
+        let mut signals = Self::get_signals_map(&env);
+        let mut signal = signals
+            .get(signal_id)
+            .ok_or(SignalEditError::SignalNotFound)?;
+
+        let new_version = versioning::edit_signal_with_audit(
+            &env,
+            signal_id,
+            &provider,
+            new_price,
+            new_rationale,
+            new_expiry,
+            &mut signal,
+        )?;
+
+        signals.set(signal_id, signal.clone());
+        Self::save_signals_map(&env, &signals);
+        Ok(new_version)
+    }
+
+    /// Retrieve the full version history for a signal (audit trail, Issue #686).
+    /// Returns all stored versions in chronological order.
+    pub fn get_signal_version_history(
+        env: Env,
+        signal_id: u64,
+    ) -> Vec<versioning::SignalVersion> {
+        versioning::get_signal_history(&env, signal_id)
+    }
+
     /// Record closed-signal outcome and update provider reputation (Issue #170).
     pub fn record_signal_outcome(
         env: Env,

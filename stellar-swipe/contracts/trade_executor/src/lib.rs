@@ -6,6 +6,7 @@ pub mod feature_flags;
 pub mod keeper;
 mod oracle;
 pub mod risk_gates;
+pub mod priority;
 pub mod sdex;
 pub mod triggers;
 mod wire;
@@ -1165,10 +1166,15 @@ impl TradeExecutorContract {
     /// Execute a batch of copy trades. Each trade is attempted independently;
     /// a failure in one trade does NOT roll back successful trades.
     ///
-    /// Returns a `Vec<BatchTradeResult>` with one entry per input trade, in order.
+    /// Trades are processed in priority-tier order (high-stake -> high-tenure -> standard)
+    /// when a portfolio contract is configured (Issue #682). A fairness fallback
+    /// prevents starvation of standard followers after N consecutive priority-only batches.
+    ///
+    /// Returns a Vec<BatchTradeResult> with one entry per input trade, in the
+    /// priority-sorted order (not the original input order).
     ///
     /// # Errors
-    /// - [`ContractError::InvalidAmount`] — batch is empty or exceeds `MAX_BATCH_SIZE`.
+    /// - [ContractError::InvalidAmount] - batch is empty or exceeds MAX_BATCH_SIZE.
     pub fn batch_execute(
         env: Env,
         trades: Vec<BatchTradeInput>,

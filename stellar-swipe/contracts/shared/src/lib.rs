@@ -1,5 +1,7 @@
 #![no_std]
 
+pub mod access_control;
+
 pub mod auth;
 #[allow(deprecated)]
 pub mod cross_contract;
